@@ -1,0 +1,9 @@
+# Ignore everything
+*
+
+# But track these files and folders
+!.gitignore
+!Makefile
+!*.vhd
+!*.vhdl
+!docs/
