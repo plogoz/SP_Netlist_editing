@@ -1,21 +1,35 @@
 .PHONY: help sim surfer synth net editing visualize verify editing-cdl verify-cdl clean all
 
-# skywater130nm path
-LIB = skywater-pdk-libs-sky130_fd_sc_hd/timing/sky130_fd_sc_hd__tt_025C_1v80.lib
+# ============================================================================
+# Variables  (override on the command line, e.g. `make editing N_BUFF=3`)
+# ============================================================================
+#
+# Shared
+#   N_BUFF     Max consecutive logic gates between restoration points
+#              (flip-flops / buffers). Drives buffer insertion in `editing`
+#              and `editing-cdl`.
+#
+# sky130 / Liberty flow
+#   LIB        Liberty file used by `net`, `editing`, and `verify`.
+#
+# Closed-source / CDL flow
+#   CDL        CDL input(s): a single file, a quoted list, or a directory.
+#                CDL=foo.cdl   CDL="a.cdl b.cdl"   CDL=pdk_cdls/
+#              Duplicate cell names across files are a hard error.
+#   CELL_META  Sidecar JSON(s) flagging buffer / sequential cells.
+#              Omit to auto-discover <stem>.cells.json next to each CDL.
+#   STUB_LIB   Auto-generated Liberty stub consumed by `verify-cdl`.
 
-# Closed-source / CDL flow (parallel to the sky130 .lib flow above).
-# Override on the command line as needed. CDL can be a single file, a
-# space-separated list, or a directory of *.cdl:
-#   make editing-cdl CDL=foo.cdl
-#   make editing-cdl CDL="foo.cdl bar.cdl"
-#   make editing-cdl CDL=pdk_cdls/
-# CELL_META is optional — omit to let each CDL auto-discover its own
-# <stem>.cells.json sidecar; pass one or more files to override.
+LIB       = skywater-pdk-libs-sky130_fd_sc_hd/timing/sky130_fd_sc_hd__tt_025C_1v80.lib
+N_BUFF    = 5
+
 CDL       ?= TEST_CELLS.cdl
 CELL_META ?= TEST_CELLS.cells.json
 STUB_LIB  ?= cdl_stub.lib
 
-N_BUFF = 5
+# ============================================================================
+# Help
+# ============================================================================
 
 help:
 	@echo "=== flip_flop_adder Project ==="
@@ -36,6 +50,10 @@ help:
 	@echo "  make help      - Show this help message"
 	@echo ""
 
+# ============================================================================
+# Simulation (GHDL) — analyse, elaborate, run, view waveforms
+# ============================================================================
+
 sim:
 	ghdl -a --std=08 fsm.vhdl
 	ghdl -a --std=08 tb_flip_flop_adder.vhdl
@@ -44,6 +62,10 @@ sim:
 
 surfer:
 	surfer tb.vcd
+
+# ============================================================================
+# Synthesis (Yosys + GHDL plugin) — VHDL → Verilog netlist
+# ============================================================================
 
 synth: # generic library synthesis
 	GHDL_PREFIX=/opt/homebrew/lib/ghdl yosys -m ghdl -p "\
@@ -58,6 +80,10 @@ net: # synthesis with SkyWater130nm mapping
 		dfflibmap -liberty $(LIB); \
 		abc -liberty $(LIB); \
 		write_verilog fsm_netlist.v"
+
+# ============================================================================
+# Editing & verify — sky130 / Liberty flow
+# ============================================================================
 
 editing:
 	uv run python -m netlist_tool fsm_netlist.v fsm_modified.v --N $(N_BUFF) --lib $(LIB)
@@ -84,12 +110,13 @@ verify: fsm_netlist.v fsm_modified.v
 
 all : clean net editing verify
 
-# --- closed-source / CDL flow -----------------------------------------------
-# Uses the CDL backend instead of Liberty. Pair with $(CELL_META) so the
-# tool knows which cells are buffers vs flip-flops (CDL itself doesn't
-# encode that). `verify-cdl` runs a structural equivalence check via an
-# auto-generated stub .lib — sequential semantics are deferred to vendor
-# LEC (see docs/netlist_editing_workflow.md §5.5).
+# ============================================================================
+# Editing & verify — closed-source / CDL flow
+# ============================================================================
+# Same pipeline as the sky130 flow, but uses CDL + sidecar JSON instead of
+# Liberty. `verify-cdl` proves structural equivalence via an auto-generated
+# stub .lib; sequential semantics are deferred to vendor LEC.
+# See docs/cdl_backend.md and docs/netlist_editing_workflow.md §5.5.
 
 editing-cdl:
 	uv run python -m netlist_tool fsm_netlist.v fsm_modified.v \
@@ -114,6 +141,10 @@ verify-cdl: fsm_netlist.v fsm_modified.v $(STUB_LIB)
 		prep -flatten; \
 		equiv_induct -seq 10; \
 		equiv_status -assert"
+
+# ============================================================================
+# Clean
+# ============================================================================
 
 clean:
 	rm -f *.o *.cf *.vcd
