@@ -141,7 +141,8 @@ verify-cdl: fsm_netlist.v fsm_modified.v $(STUB_LIB)
 		prep -flatten; \
 		equiv_induct -seq 10; \
 		equiv_status -assert"
-
+		rm -f $(STUB_LIB)
+		rm -rf .cdlcache
 # ============================================================================
 # Clean
 # ============================================================================
