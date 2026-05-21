@@ -11,5 +11,9 @@
 !*.vhdl
 !docs/
 !scripts/
+!scripts/*
 !netlist_tool/
 !netlist_tool/*
+!skywater-pdk-libs-sky130_fd_sc_hd/timing/sky130_fd_sc_hd__tt_025C_1v80.lib
+!ghdl-yosys-plugin/
+!ghdl-yosys-plugin/*
