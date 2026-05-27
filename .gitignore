@@ -3,6 +3,7 @@
 
 # But track these files and folders
 !.gitignore
+!.gitmodules
 !uv.lock
 !pyproject.toml
 !.python-version
@@ -14,10 +15,7 @@
 !scripts/**
 !netlist_tool/
 !netlist_tool/**
+# sky130 PDK: only the nominal timing corner (full repo: https://github.com/efabless/skywater-pdk-libs-sky130_fd_sc_hd.git)
 !skywater-pdk-libs-sky130_fd_sc_hd/
-!skywater-pdk-libs-sky130_fd_sc_hd/**
 !skywater-pdk-libs-sky130_fd_sc_hd/timing/
-!skywater-pdk-libs-sky130_fd_sc_hd/timing/**
 !skywater-pdk-libs-sky130_fd_sc_hd/timing/sky130_fd_sc_hd__tt_025C_1v80.lib
-!ghdl-yosys-plugin/
-!ghdl-yosys-plugin/**

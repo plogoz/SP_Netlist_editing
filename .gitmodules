@@ -1,0 +1,3 @@
+[submodule "ghdl-yosys-plugin"]
+	path = ghdl-yosys-plugin
+	url = https://github.com/ghdl/ghdl-yosys-plugin.git
