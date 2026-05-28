@@ -32,19 +32,20 @@ import json
 import re
 from pathlib import Path
 
-import pyparsing as pp
-
 from .cell_info import CellInfo
 
 # ---------------------------------------------------------------------------
-# 1. Comment stripping  (pyparsing — handles multi-line /* */ correctly)
+# 1. Comment stripping  (regex — handles multi-line /* */ correctly)
 # ---------------------------------------------------------------------------
+# Plain re.sub instead of pyparsing.transform_string: the latter's packrat
+# cache evicts via O(n) dict iteration, which turns into multi-minute hangs
+# on the 12 MB sky130 .lib under Python 3.14.
 
-_COMMENT = pp.cpp_style_comment | pp.Regex(r"//[^\n]*")
+_COMMENT = re.compile(r"/\*.*?\*/|//[^\n]*", re.DOTALL)
 
 
 def _strip_comments(text: str) -> str:
-    return _COMMENT.transform_string(text)
+    return _COMMENT.sub("", text)
 
 
 # ---------------------------------------------------------------------------

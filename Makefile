@@ -47,6 +47,12 @@ MODIFIED   ?= $(_NET_STEM)_modified.v
 LIB       = skywater-pdk-libs-sky130_fd_sc_hd/timing/sky130_fd_sc_hd__tt_025C_1v80.lib
 N_BUFF    = 5
 
+ifeq ($(shell uname),Darwin)
+GHDL_PREFIX ?= /opt/homebrew/lib/ghdl
+else
+GHDL_PREFIX ?= /usr/lib/ghdl
+endif
+
 CDL       ?= TEST_CELLS.cdl
 CELL_META ?= TEST_CELLS.cells.json
 STUB_LIB  ?= cdl_stub.lib
@@ -78,6 +84,7 @@ help:
 	@echo "  NETLIST=$(NETLIST)  MODIFIED=$(MODIFIED)"
 	@echo "  N_BUFF=$(N_BUFF)  LIB=$(LIB)"
 	@echo "  CDL=$(CDL)  CELL_META=$(CELL_META)  STUB_LIB=$(STUB_LIB)"
+	@echo "  GHDL_PREFIX=$(GHDL_PREFIX)"
 	@echo ""
 	@echo "Examples:"
 	@echo "  make all VHDL=adder.vhdl TOP=adder_top   # rebrand the whole flow"
@@ -102,13 +109,13 @@ surfer:
 # ============================================================================
 
 synth: # generic library synthesis
-	GHDL_PREFIX=/opt/homebrew/lib/ghdl yosys -m ghdl -p "\
+	GHDL_PREFIX=$(GHDL_PREFIX) yosys -m ghdl -p "\
     	ghdl --std=08 $(VHDL) -e $(TOP); \
         synth -top $(TOP); \
      	write_verilog $(NETLIST)"
 
 net: # synthesis with SkyWater130nm mapping
-	GHDL_PREFIX=/opt/homebrew/lib/ghdl yosys -m ghdl -p "\
+	GHDL_PREFIX=$(GHDL_PREFIX) yosys -m ghdl -p "\
 		ghdl --std=08 $(VHDL) -e $(TOP); \
 		synth -top $(TOP); \
 		dfflibmap -liberty $(LIB); \
