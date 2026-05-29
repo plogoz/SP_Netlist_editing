@@ -72,12 +72,15 @@ def _diagnose_cycle(graph: nx.DiGraph, cells: dict) -> None:
 
     type_counts: Counter[str] = Counter()
     has_sequential = False
+    restoring_in_cycle: set[str] = set()
     for u, _ in cycle_edges:
         t = graph.nodes[u].get("cell_type") or "(port)"
         type_counts[t] += 1
         ci = cells.get(t)
         if ci is not None and ci.is_seq:
             has_sequential = True
+        if ci is not None and ci.is_restoring:
+            restoring_in_cycle.add(t)
 
     seq_label = "yes" if has_sequential else "no"
     print(
@@ -86,6 +89,22 @@ def _diagnose_cycle(graph: nx.DiGraph, cells: dict) -> None:
         file=sys.stderr,
     )
     print(f"  Cell-type histogram in cycle: {dict(type_counts)}", file=sys.stderr)
+    if not has_sequential:
+        # Only sequential cells cut the graph; restoring cells reset depth but
+        # keep their edges, so a loop with no sequential cell cannot be broken.
+        print(
+            "  This loop has no sequential cell, so nothing cuts it. Whatever "
+            "holds state in this loop must be tagged in the sidecar's "
+            '"sequential" list (not "restoring"). See '
+            "docs/netlist_editing_workflow.md §8.6.",
+            file=sys.stderr,
+        )
+        if restoring_in_cycle:
+            print(
+                f"  Note: {sorted(restoring_in_cycle)} are tagged \"restoring\" "
+                "(depth reset only) — that does not break the loop.",
+                file=sys.stderr,
+            )
 
     shown = min(max_path_edges, len(cycle_edges))
     print(f"  Cycle path (first {shown} edge(s)):", file=sys.stderr)
@@ -190,9 +209,9 @@ def insert_buffers(
                 output_nets.append(net)
 
         # Restoration point → outputs at depth 0, no buffering.
-        if cell_info is not None and (
-            cell_info.is_sequential() or cell_info.is_buffer()
-        ):
+        # Covers sequential cells, 1-in/1-out buffers, and `restoring`
+        # re-drivers (e.g. a buffering mux tagged in the CDL sidecar).
+        if cell_info is not None and cell_info.is_restoration_point():
             for n in output_nets:
                 depth[n] = 0
             continue

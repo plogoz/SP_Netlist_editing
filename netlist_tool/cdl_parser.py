@@ -20,6 +20,7 @@ read a sidecar JSON file:
     {
       "buffers":    ["BUFF_TEST", "CLKBUF_X1"],
       "sequential": ["DFF_TEST",  "DLAT_TEST"],
+      "restoring":  ["MUX_TEST"],
       "functions": {
         "AND_TEST": { "Y": "(A & B)" },
         "INV_TEST": { "Y": "(!A)"    }
@@ -31,6 +32,13 @@ cells, which `emit_stub_lib` then emits as `function : "..."` lines so
 that `equiv_induct` can reason through them. Sequential cells stay
 opaque blackboxes (no `ff()` block); the two-pass `read_liberty` in the
 Makefile keeps them around as bare-blackbox modules.
+
+The `restoring` list tags multi-pin cells that re-drive a signal (e.g. a
+buffering mux). They act as restoration points for depth-based insertion
+(the counter resets on their output) but are NOT 1-in/1-out insertion
+buffers and do NOT cut the graph — see docs/netlist_editing_workflow.md
+§8.6. The flag only affects insertion; a restoring cell still carries its
+`functions` entry so `verify-cdl` reasons through it normally.
 
 Multi-input: the parser accepts a single CDL path, a list of CDL paths,
 or a directory of CDLs (top-level *.cdl only). All cells are merged
@@ -137,8 +145,12 @@ def _apply_meta(
     meta: dict,
     meta_source: str,
 ) -> None:
-    """Set is_buf / is_seq / pin_function from a sidecar dict. Warn on unknown names."""
-    for key, attr in (("buffers", "is_buf"), ("sequential", "is_seq")):
+    """Set is_buf / is_seq / is_restoring / pin_function from a sidecar dict. Warn on unknown names."""
+    for key, attr in (
+        ("buffers", "is_buf"),
+        ("sequential", "is_seq"),
+        ("restoring", "is_restoring"),
+    ):
         names = meta.get(key, []) or []
         if not isinstance(names, list):
             raise ValueError(
@@ -253,7 +265,7 @@ class CdlParser:
     more sidecar JSONs. See module docstring for the precedence rules.
     """
 
-    _CACHE_VERSION = 3
+    _CACHE_VERSION = 4
     _CACHE_DIR = Path(".cdlcache")
 
     def __init__(
@@ -397,6 +409,7 @@ class CdlParser:
                     "pin_function": cell.pin_function,
                     "is_seq": cell.is_seq,
                     "is_buf": cell.is_buf,
+                    "is_restoring": cell.is_restoring,
                 }
                 for name, cell in self._db.items()
             },
@@ -415,6 +428,7 @@ class CdlParser:
                 pin_function=entry.get("pin_function", {}),
                 is_seq=entry.get("is_seq", False),
                 is_buf=entry.get("is_buf", False),
+                is_restoring=entry.get("is_restoring", False),
             )
             for name, entry in data["cells"].items()
         }

@@ -385,9 +385,97 @@ Two traps when diagnosing this:
    there. Without this the tool cannot know where to cut.
 2. **Cut the graph at sequential cells** in `build_graph`: skip registering a
    sequential cell's output as a net driver, so its `Q` becomes a graph source
-   and every register loop opens into a DAG. *(Not yet implemented — the tool
-   has been relying on the bus-alias accident above, which only held for
-   Yosys-style netlists.)*
+   and every register loop opens into a DAG. *(Implemented — `build_graph`
+   computes `seq_types` from `is_seq` and skips those instances when building
+   the net→driver map. Verified: sky130 still inserts 3 buffers, and a directly
+   wired feedback netlist with no `assign` aliases now becomes a DAG.)*
+
+### 8.7 `restoring` cells — depth reset without a cut
+
+Some libraries have a cell that performs logic **and** re-drives the signal —
+e.g. a **mux that also acts as a buffer**. For signal integrity it is a
+restoration point (consecutive-logic depth should reset on its output), but it
+is multi-pin so it cannot go in `"buffers"` (that list doubles as the pool of
+1-in/1-out cells eligible to be *inserted*, which a mux cannot be).
+
+The CDL sidecar carries a third classification list for these:
+
+```json
+{
+  "sequential": ["DFF_TEST"],
+  "buffers":    ["BUFF_TEST"],
+  "restoring":  ["MUX_TEST"],
+  "functions":  { "AND_TEST": { "Y": "(A & B)" } }
+}
+```
+
+A `restoring` cell **resets the insertion depth counter on its output but does
+not cut the graph** (`inserter.py` treats it as a restoration point via
+`CellInfo.is_restoration_point()`; `graph_builder` still cuts on `is_seq`
+alone). This is deliberate: the inserter runs `topological_sort` *before* the
+depth walk, so a reset-only flag is a placement refinement and **cannot break a
+cycle**. Loop breaking remains the job of the sequential cut (§8.6).
+
+**Consequence:** every loop must still contain a `sequential` cell. If a cell
+genuinely *holds state* — a mux-latch with feedback and no separate flip-flop —
+it belongs in `"sequential"` (cut + reset), not `"restoring"` (reset only).
+`_diagnose_cycle` now says so explicitly when a surviving cycle contains no
+sequential cell.
+
+`restoring` is orthogonal to equivalence: the cell keeps its `functions` entry,
+so `emit_stub_lib` emits its function and `verify-cdl` reasons through it
+normally.
+
+`scripts/lib_to_cdl.py` grows a `--restoring CELL …` option to tag cells when
+bootstrapping a CDL+sidecar from a Liberty (the flag can't be derived from
+Liberty — it's a signal-integrity judgement):
+
+```bash
+uv run python scripts/lib_to_cdl.py <lib> -o out.cdl \
+    --restoring sky130_fd_sc_hd__mux2_1
+```
+
+### 8.8 Cell-class reference and the real-CDL bring-up loop
+
+The three sidecar lists answer three independent questions. A cell can be in
+at most one (a `restoring` cell never goes in `buffers` and vice-versa):
+
+| Cell class            | Sidecar key    | Cuts the graph? | Resets depth? | Insertable buffer? |
+|-----------------------|----------------|-----------------|---------------|--------------------|
+| Sequential (flop/latch) | `"sequential"` | **yes** (opens loops) | yes | no |
+| Buffer (1-in/1-out)   | `"buffers"`    | no              | yes           | yes (auto-selected) |
+| Restoring (e.g. mux)  | `"restoring"`  | no              | yes           | no |
+
+- **Cuts the graph** → makes the combinational graph a DAG (§8.6). Only
+  sequential cells do this.
+- **Resets depth** → the consecutive-logic counter restarts on the cell's
+  output, so no buffer is inserted right after it (`is_restoration_point()`).
+- **Insertable** → eligible to be the cell the tool *inserts*; must be a
+  1-in/1-out buffer (a mux can't be — it needs a select line).
+
+**Bringing the flow up on a real vendor CDL.** The sidecar is the only place
+the classification the CDL omits gets injected, so expect to iterate on it:
+
+1. Run `make editing-cdl CDL=… CELL_META=…`. If it fails with
+   `graph contains a cycle`, read the diagnostic, **not** the
+   `contains sequential cell?` line (it's `is_seq`-derived and lies when flops
+   are untagged — §8.6). Read the `Cell-type histogram in cycle:` line.
+2. Every cell type in that histogram that **holds state** (flip-flop, latch, or
+   a mux-latch that closes a feedback loop itself) goes in `"sequential"`. That
+   is what breaks the loop. Re-run.
+3. If a cycle still survives and its histogram contains **no** sequential cell,
+   `_diagnose_cycle` now prints exactly that, plus a reminder that `"restoring"`
+   does not break loops — find the state element in the loop and move it to
+   `"sequential"`.
+4. Once editing succeeds, tag your re-driving combinational cells (e.g. a
+   buffering mux) in `"restoring"` to refine *where* buffers land. This never
+   affects whether the run succeeds — only placement.
+5. Run `make verify-cdl` to confirm the edit is logically equivalent (catches
+   inserter bugs in ~seconds, instead of the 40-min SPICE run). Sequential
+   semantics are still deferred to vendor LEC.
+
+The split matters: **`sequential` decides whether the run *works*; `restoring`
+only decides whether the buffers land in the *right place*.**
 
 ---
 

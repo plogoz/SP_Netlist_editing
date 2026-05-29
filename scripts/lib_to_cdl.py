@@ -14,11 +14,18 @@ blackboxes per docs/cdl_backend.md §4.
 Usage
 -----
     uv run python scripts/lib_to_cdl.py <lib_path> -o <out.cdl>
+    uv run python scripts/lib_to_cdl.py <lib_path> -o <out.cdl> \
+        --restoring sky130_fd_sc_hd__mux2_1
 
 Outputs
 -------
     <out.cdl>          .SUBCKT / *.PININFO blocks
-    <out.cells.json>   sidecar with buffers / sequential / functions
+    <out.cells.json>   sidecar with buffers / sequential / restoring / functions
+
+The `restoring` list cannot be derived from Liberty (it is a
+signal-integrity judgement), so cells are named explicitly with
+--restoring. They reset insertion depth like a buffer but are multi-pin
+and do not cut the graph. See docs/netlist_editing_workflow.md §8.6.
 """
 
 from __future__ import annotations
@@ -70,7 +77,7 @@ def _emit_cdl(db: dict[str, CellInfo], source_name: str) -> str:
     return "\n".join(lines)
 
 
-def _emit_sidecar(db: dict[str, CellInfo]) -> dict:
+def _emit_sidecar(db: dict[str, CellInfo], restoring: list[str] | None = None) -> dict:
     buffers: list[str] = []
     sequential: list[str] = []
     functions: dict[str, dict[str, str]] = {}
@@ -83,12 +90,25 @@ def _emit_sidecar(db: dict[str, CellInfo]) -> dict:
         if not cell.is_seq and cell.pin_function:
             # Only carry the function strings for cells we're willing to
             # characterise. Sequential cells stay opaque; emit_stub_lib
-            # would drop their function anyway.
+            # would drop their function anyway. Restoring cells keep their
+            # function here so verify-cdl can still reason through them.
             functions[name] = dict(cell.pin_function)
+
+    # `restoring` cannot be derived from Liberty (it is a signal-integrity
+    # judgement the user makes), so it is supplied explicitly via --restoring.
+    restoring = restoring or []
+    for name in restoring:
+        if name not in db:
+            print(
+                f"warning: --restoring '{name}' is not a cell in the parsed "
+                "Liberty; emitting it anyway",
+                file=sys.stderr,
+            )
 
     return {
         "buffers": sorted(buffers),
         "sequential": sorted(sequential),
+        "restoring": sorted(set(restoring)),
         "functions": dict(sorted(functions.items())),
     }
 
@@ -115,6 +135,16 @@ def main(argv: list[str] | None = None) -> int:
         metavar="CDL",
         help="Destination CDL path. Default: <lib_stem>.cdl next to the source.",
     )
+    ap.add_argument(
+        "--restoring",
+        nargs="*",
+        default=[],
+        metavar="CELL",
+        help="Cell names to tag as 'restoring' in the sidecar: multi-pin "
+        "re-drivers (e.g. a buffering mux) that reset insertion depth but do "
+        "not cut the graph. Cannot be derived from Liberty, so it is listed "
+        "explicitly. Example: --restoring sky130_fd_sc_hd__mux2_1",
+    )
     args = ap.parse_args(argv)
 
     if not args.lib.exists():
@@ -134,12 +164,13 @@ def main(argv: list[str] | None = None) -> int:
     cdl_out.write_text(cdl_text, encoding="utf-8")
     print(f"Wrote {cdl_out}")
 
-    sidecar = _emit_sidecar(db)
+    sidecar = _emit_sidecar(db, restoring=args.restoring)
     sidecar_out.write_text(json.dumps(sidecar, indent=2) + "\n", encoding="utf-8")
     print(
         f"Wrote {sidecar_out} "
         f"(buffers={len(sidecar['buffers'])}, "
         f"sequential={len(sidecar['sequential'])}, "
+        f"restoring={len(sidecar['restoring'])}, "
         f"functions={len(sidecar['functions'])})"
     )
 

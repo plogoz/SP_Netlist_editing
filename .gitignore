@@ -16,6 +16,7 @@
 !netlist_tool/
 !netlist_tool/**
 *netlist_tool/__pycache__/
+*netlist_tool/__pycache__/**
 # sky130 PDK: only the nominal timing corner (full repo: https://github.com/efabless/skywater-pdk-libs-sky130_fd_sc_hd.git)
 !skywater-pdk-libs-sky130_fd_sc_hd/
 !skywater-pdk-libs-sky130_fd_sc_hd/timing/

@@ -31,6 +31,11 @@ class CellInfo:
     pin_function: dict[str, str] = field(default_factory=dict)  # output_pin → fn expr
     is_seq: bool = False  # ff()/latch() in Liberty, or sidecar flag for CDL
     is_buf: bool = False  # sidecar flag (CDL only); Liberty path leaves False
+    is_restoring: bool = False  # sidecar flag (CDL only): a multi-pin cell that
+    # re-drives a signal (e.g. a buffering mux). It is a restoration point
+    # (depth resets on its output) but is NOT a 1-in/1-out insertion buffer and
+    # does NOT cut the graph — the loop it sits on is broken at a sequential
+    # cell. Liberty path leaves this False.
 
     def signal_pins(self) -> dict[str, str]:
         """Signal pins only (excludes power/ground)."""
@@ -64,3 +69,14 @@ class CellInfo:
         while func.startswith("(") and func.endswith(")"):
             func = func[1:-1].strip()
         return func == ins[0]
+
+    def is_restoration_point(self) -> bool:
+        """True iff this cell re-drives its output, resetting logic depth.
+
+        Sequential cells, 1-in/1-out buffers, and `is_restoring` re-drivers
+        (e.g. a buffering mux) all qualify. The inserter resets the depth
+        counter on the outputs of any such cell. Note this is broader than the
+        graph cut, which is keyed on `is_seq` alone (only flops/latches open
+        feedback loops; buffers and restoring cells reset depth without cutting).
+        """
+        return self.is_seq or self.is_buffer() or self.is_restoring
