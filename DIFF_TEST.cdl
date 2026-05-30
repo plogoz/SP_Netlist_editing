@@ -1,15 +1,18 @@
 * Synthetic differential standard-cell stub for testing the N-lane buffer flow.
 * Every signal is a (true, complement) pair, so cells are 2-in/2-out per phase.
-* Not a real PDK; pin directions only. See docs/netlist_editing_workflow.md.
+* Signal pins are declared :B (bias/bidirectional) — the physically honest
+* label a real differential CDL uses — so this also exercises the direction
+* inference from the sidecar's "functions". Not a real PDK; pin info only.
+* See docs/netlist_editing_workflow.md §8.9.
 
 .SUBCKT AND2D A0 A0N A1 A1N Z ZN
-*.PININFO A0:I A0N:I A1:I A1N:I Z:O ZN:O
+*.PININFO A0:B A0N:B A1:B A1N:B Z:B ZN:B
 .ENDS
 
 .SUBCKT BUFD A AN Z ZN
-*.PININFO A:I AN:I Z:O ZN:O
+*.PININFO A:B AN:B Z:B ZN:B
 .ENDS
 
 .SUBCKT DFFD CK D DN Q QN
-*.PININFO CK:I D:I DN:I Q:O QN:O
+*.PININFO CK:B D:B DN:B Q:B QN:B
 .ENDS

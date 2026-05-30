@@ -33,6 +33,16 @@ that `equiv_induct` can reason through them. Sequential cells stay
 opaque blackboxes (no `ff()` block); the two-pass `read_liberty` in the
 Makefile keeps them around as bare-blackbox modules.
 
+`functions` doubles as a *direction* source. Differential CDLs often
+declare every signal pin `:B` (bias/bidirectional — the label LVS and
+SPICE want, since current may flow either way), which maps to "power"
+and hides the logical in/out the inserter needs. So after loading a
+cell's functions we infer directions: a function key is an output, a pin
+referenced in an expression is an input. Only pins still tagged "power"
+are upgraded, so explicit `:I`/`:O` and true supply pins are untouched,
+and the `.cdl` itself is never edited. See
+docs/netlist_editing_workflow.md §8.9.
+
 The `restoring` list tags multi-pin cells that re-drive a signal (e.g. a
 buffering mux). They act as restoration points for depth-based insertion
 (the counter resets on their output) but are NOT 1-in/1-out insertion
@@ -139,6 +149,41 @@ def _scan(text: str) -> dict[str, CellInfo]:
 # Sidecar classification
 # ---------------------------------------------------------------------------
 
+# Identifier token in a Liberty-style function expression. Operators
+# (& | ! ^ ' parens) and constants (0/1) are not identifiers, so this picks
+# out only pin names.
+_FUNC_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _infer_directions_from_functions(cell: CellInfo) -> None:
+    """Recover signal-pin directions from a cell's functions.
+
+    CDL `*.PININFO` often declares pins as `:B` (bias/bidirectional) — the
+    physically honest label that LVS and SPICE want — which maps to "power"
+    and hides the logical in/out the inserter needs. The sidecar `functions`
+    encode that logical view: a function *key* is an output, and any pin name
+    *referenced* in an expression is an input. We use that to upgrade pins that
+    are still "power", leaving explicit `:I`/`:O` and true power/ground pins
+    (those never named in a function) untouched.
+    """
+    if not cell.pin_function:
+        return
+
+    outputs = set(cell.pin_function)
+    inputs: set[str] = set()
+    for expr in cell.pin_function.values():
+        for tok in _FUNC_IDENT_RE.findall(expr):
+            if tok in cell.pins:
+                inputs.add(tok)
+    inputs -= outputs  # a key is an output even if it also appears in an expr
+
+    for pin in outputs:
+        if cell.pins.get(pin) == "power":
+            cell.pins[pin] = "output"
+    for pin in inputs:
+        if cell.pins.get(pin) == "power":
+            cell.pins[pin] = "input"
+
 
 def _apply_meta(
     cells: dict[str, CellInfo],
@@ -196,6 +241,9 @@ def _apply_meta(
                 )
                 continue
             cell.pin_function[pin_name] = expr
+
+        # Recover logical in/out for any pin the CDL left as :B (-> "power").
+        _infer_directions_from_functions(cell)
 
 
 # ---------------------------------------------------------------------------
@@ -265,7 +313,7 @@ class CdlParser:
     more sidecar JSONs. See module docstring for the precedence rules.
     """
 
-    _CACHE_VERSION = 4
+    _CACHE_VERSION = 5
     _CACHE_DIR = Path(".cdlcache")
 
     def __init__(

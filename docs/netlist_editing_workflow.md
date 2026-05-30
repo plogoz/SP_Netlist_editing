@@ -514,6 +514,42 @@ giving its identity functions:
 (A single-ended CDL buffer needs no `functions` entry — a 1-in/1-out cell listed
 in `"buffers"` falls back to one lane automatically.)
 
+**Pin directions: the `:B` trap, and why `functions` fixes it.** A differential
+CDL routinely declares *every* signal pin `:B` in `*.PININFO`:
+
+```
+.SUBCKT BUFF_PP_DPTLSL I IB Q QB
+*.PININFO I:B IB:B Q:B QB:B
+.ENDS
+```
+
+`:B` (bias/bidirectional) is the *physically honest* label — current may flow
+either way (e.g. a node sinking charge to discharge a transistor) — so the
+vendor uses it, and **LVS/CDL-comparison decks assert it against the layout**.
+But the parser maps `:B` to `"power"` (`cdl_parser.py`), so `input_pins()` and
+`output_pins()` both come back empty: `buffer_lanes()` returns `None` and you
+get `no buffer cell found` even with a correct `"buffers"` + `"functions"`. This
+is the single most common bring-up failure on a real differential CDL, and it's
+why sky130 (clean `:I`/`:O`) never hits it.
+
+You **must not** rewrite the `.cdl` to `:I`/`:O`: the *same file* feeds the AMS
+SPICE simulation and LVS. The `*.PININFO` line is a SPICE *comment* (`*` prefix),
+so the simulator ignores it and your results are unchanged — **but** LVS does
+read it, and flipping a genuinely bidirectional pin to `:I`/`:O` can raise
+pin-direction mismatches. Liberty's `direction:` is the *logical* abstraction
+digital tools need (asserted even when real current flows the other way); CDL
+`:B` is the *physical* truth. Keep both honest by keeping them separate.
+
+So instead the CDL backend **infers logical directions from `functions`**: a
+function key is an output, a pin named inside an expression is an input. Only
+pins still tagged `"power"` (i.e. the `:B` ones) are upgraded — explicit `:I`/
+`:O` and true supply pins (never named in a function) are left alone, and the
+`.cdl` is never touched. For the buffer above, `{"Q":"(I)","QB":"(IB)"}` recovers
+`Q,QB` as outputs and `I,IB` as inputs, yielding lanes `[("I","Q"),("IB","QB")]`.
+The practical consequence: **on a differential CDL, every cell that participates
+in insertion needs a `functions` entry** — not only for `verify-cdl`, but to
+give its pins a direction at all.
+
 **Insertion is by lane chunks.** When a gate exceeds the depth limit, the tool
 buffers its output nets in chunks of `len(lanes)`, emitting one buffer instance
 per chunk. A single-ended buffer (1 lane) therefore drops one instance per
