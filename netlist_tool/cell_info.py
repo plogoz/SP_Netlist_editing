@@ -51,24 +51,62 @@ class CellInfo:
         """True iff this cell holds state (FF or latch)."""
         return self.is_seq
 
-    def is_buffer(self) -> bool:
-        """True iff this cell is a 1-input/1-output combinational buffer.
+    def buffer_lanes(self) -> list[tuple[str, str]] | None:
+        """Identity lanes if this cell is a buffer, else None.
 
-        Two paths:
-          - Explicit: `is_buf` set (CDL sidecar classification).
-          - Derived: Liberty `function` of the single output pin equals
-            the single input pin name, ignoring surrounding parens.
+        A *buffer* re-drives each input onto a matching output unchanged. We
+        generalize from the single-ended 1-in/1-out case to N lanes so that a
+        differential buffer (2-in/2-out: A,AN -> Z,ZN) is recognized too:
+
+            single-ended:  [("A", "Y")]
+            differential:  [("A", "Z"), ("AN", "ZN")]
+
+        A lane (in_pin, out_pin) exists when out_pin's function is the identity
+        of in_pin. The cell qualifies iff it has an equal, non-zero number of
+        inputs and outputs and every output maps to a distinct input this way.
+        Lanes are returned in output-pin declaration order.
+
+        Two derivation paths, mirroring the two backends:
+          - Liberty: each output's `function` string equals an input pin name
+            (parens stripped). This also covers single-ended sky130 buffers.
+          - CDL sidecar: the `functions` map populates `pin_function` the same
+            way, so a differential buffer needs `functions` (e.g. {"Z":"A",
+            "ZN":"AN"}) to expose its lanes.
+
+        Fallback: a 1-in/1-out cell flagged `is_buf` with no function still
+        yields one lane, so single-ended CDL sidecars that only list a name
+        under "buffers" keep working without a `functions` entry.
         """
         ins = self.input_pins()
         outs = self.output_pins()
-        if len(ins) != 1 or len(outs) != 1:
-            return False
-        if self.is_buf:
-            return True
-        func = self.pin_function.get(outs[0], "").strip()
-        while func.startswith("(") and func.endswith(")"):
-            func = func[1:-1].strip()
-        return func == ins[0]
+        if not ins or len(ins) != len(outs):
+            return None
+
+        lanes: list[tuple[str, str]] = []
+        used_inputs: set[str] = set()
+        for out_pin in outs:
+            func = self.pin_function.get(out_pin, "").strip()
+            while func.startswith("(") and func.endswith(")"):
+                func = func[1:-1].strip()
+            if func in ins and func not in used_inputs:
+                lanes.append((func, out_pin))
+                used_inputs.add(func)
+        if len(lanes) == len(outs):
+            return lanes
+
+        # No (complete) function-derived mapping. Single-ended is_buf cells from
+        # a CDL sidecar carry no function, so honour the explicit flag here.
+        if self.is_buf and len(ins) == 1 and len(outs) == 1:
+            return [(ins[0], outs[0])]
+        return None
+
+    def is_buffer(self) -> bool:
+        """True iff this cell re-drives its inputs unchanged (see buffer_lanes).
+
+        Covers the single-ended 1-in/1-out buffer and the N-lane differential
+        buffer alike.
+        """
+        return self.buffer_lanes() is not None
 
     def is_restoration_point(self) -> bool:
         """True iff this cell re-drives its output, resetting logic depth.

@@ -132,17 +132,23 @@ def _describe_lib_source(args, lib) -> str:
     return lib.source_label
 
 
-def _auto_select_buffer(lib) -> tuple[str, str, str] | None:
-    """Pick a 1-input/1-output buffer cell from the parsed Liberty library.
+def _auto_select_buffer(lib) -> tuple[str, list[tuple[str, str]]] | None:
+    """Pick a buffer cell from the parsed library.
 
-    Returns (cell_name, input_pin, output_pin) for the first buffer found
-    in alphabetic order, or None if the library has no buffer cells.
+    Returns (cell_name, lanes) for the first buffer found in alphabetic order,
+    where lanes is [(in_pin, out_pin), ...] — one lane for a single-ended
+    buffer, two for a differential A,AN -> Z,ZN buffer. None if the library
+    has no buffer cells.
     """
     candidates = [c for c in lib.parse().values() if c.is_buffer()]
     if not candidates:
         return None
     chosen = min(candidates, key=lambda c: c.name)
-    return chosen.name, chosen.input_pins()[0], chosen.output_pins()[0]
+    return chosen.name, chosen.buffer_lanes()
+
+
+def _format_lanes(lanes: list[tuple[str, str]]) -> str:
+    return ", ".join(f"{in_pin}→{out_pin}" for in_pin, out_pin in lanes)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -163,33 +169,64 @@ def main(argv: list[str] | None = None) -> int:
 
     lib = _load_library(args)
 
-    if args.bb_cell is None and lib is not None:
-        pick = _auto_select_buffer(lib)
-        if pick is None:
+    # Resolve the buffer cell and its identity lanes [(in_pin, out_pin), ...].
+    lanes: list[tuple[str, str]] | None = None
+
+    # Explicit --in-port/--out-port is a single-lane override (escape hatch,
+    # and the only way to name ports without a library).
+    if args.in_port is not None and args.out_port is not None:
+        lanes = [(args.in_port, args.out_port)]
+
+    if lib is not None and lanes is None:
+        if args.bb_cell is None:
+            pick = _auto_select_buffer(lib)
+            if pick is None:
+                print(
+                    f"error: no buffer cell found in "
+                    f"{_describe_lib_source(args, lib)}. Tag a buffer in the "
+                    f'sidecar\'s "buffers" list (CDL flow) — a differential '
+                    f"buffer also needs its identity lanes in \"functions\" "
+                    f'(e.g. {{"Z":"A","ZN":"AN"}}) — or supply --bb-cell '
+                    f"explicitly. Silently falling back to a placeholder cell "
+                    f"type would produce a netlist that verify-cdl cannot "
+                    f"resolve.",
+                    file=sys.stderr,
+                )
+                return 1
+            args.bb_cell, lanes = pick
             print(
-                f"error: no buffer cell found in {_describe_lib_source(args, lib)}. "
-                f'Tag a 1-input/1-output cell in the sidecar\'s "buffers" list '
-                f"(CDL flow) or supply --bb-cell explicitly. Silently falling "
-                f"back to a placeholder cell type would produce a netlist that "
-                f"verify-cdl cannot resolve.",
-                file=sys.stderr,
+                f"\nAuto-selected buffer from {_describe_lib_source(args, lib)}: "
+                f"{args.bb_cell} ({_format_lanes(lanes)})"
             )
-            return 1
-        args.bb_cell, args.in_port, args.out_port = pick
-        print(
-            f"\nAuto-selected buffer from {_describe_lib_source(args, lib)}: "
-            f"{args.bb_cell} (in={args.in_port}, out={args.out_port})"
-        )
-    # The BLACKBOX fallback only kicks in when no library was supplied — and
-    # the lib-is-None check below rejects that case before we'd ever write a
-    # buffer. Kept as a defensive default for any future caller that bypasses
-    # the lib check.
+        else:
+            cell = lib.parse().get(args.bb_cell)
+            if cell is None:
+                print(
+                    f"error: --bb-cell '{args.bb_cell}' not found in "
+                    f"{_describe_lib_source(args, lib)}.",
+                    file=sys.stderr,
+                )
+                return 1
+            lanes = cell.buffer_lanes()
+            if lanes is None:
+                print(
+                    f"error: --bb-cell '{args.bb_cell}' is not a recognized "
+                    f"buffer (each output must be the identity of an input). "
+                    f"Tag its lanes in the sidecar's \"functions\", or pass "
+                    f"--in-port/--out-port for a single-lane override.",
+                    file=sys.stderr,
+                )
+                return 1
+            print(f"\nUsing buffer {args.bb_cell} ({_format_lanes(lanes)})")
+
+    # The BLACKBOX/placeholder fallback only kicks in when no library was
+    # supplied — and the lib-is-None check below rejects that case before we'd
+    # ever write a buffer. Kept as a defensive default for any future caller
+    # that bypasses the lib check.
     if args.bb_cell is None:
         args.bb_cell = "BLACKBOX"
-    if args.in_port is None:
-        args.in_port = "IN"
-    if args.out_port is None:
-        args.out_port = "OUT"
+    if lanes is None:
+        lanes = [("IN", "OUT")]
 
     print("\nBuilding graph ...")
     graph = build_graph(module, lib)
@@ -210,8 +247,7 @@ def main(argv: list[str] | None = None) -> int:
         args.N,
         lib,
         bb_cell=args.bb_cell,
-        in_port=args.in_port,
-        out_port=args.out_port,
+        lanes=lanes,
     )
     inserted = len(modified.instances) - len(module.instances)
     print(f"  Inserted {inserted} buffers instance(s)")

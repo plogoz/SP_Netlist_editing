@@ -126,12 +126,22 @@ def build_graph(module: Module, lib: LibParser | None = None) -> nx.DiGraph:
         )
 
     # --- Add gate nodes -------------------------------------------------------
+    # `output_nets` records every output phase (resolved, in connection order)
+    # so the inserter sees the complete set even for a differential gate, whose
+    # two output phases feeding one consumer collapse to a single DiGraph edge.
     for inst in module.instances:
+        out_nets: list[str] = []
+        for pin, ref in inst.connections.items():
+            if _is_output_pin(pin, inst.cell_type, lib):
+                net_key = _resolve_net(ref, alias)
+                if net_key not in out_nets:
+                    out_nets.append(net_key)
         G.add_node(
             inst.name,
             kind="gate",
             cell_type=inst.cell_type,
             instance=inst,
+            output_nets=out_nets,
         )
 
     # --- Build net → driver map -----------------------------------------------

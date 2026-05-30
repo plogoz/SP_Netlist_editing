@@ -443,15 +443,16 @@ at most one (a `restoring` cell never goes in `buffers` and vice-versa):
 | Cell class            | Sidecar key    | Cuts the graph? | Resets depth? | Insertable buffer? |
 |-----------------------|----------------|-----------------|---------------|--------------------|
 | Sequential (flop/latch) | `"sequential"` | **yes** (opens loops) | yes | no |
-| Buffer (1-in/1-out)   | `"buffers"`    | no              | yes           | yes (auto-selected) |
+| Buffer (N identity lanes) | `"buffers"` | no              | yes           | yes (auto-selected) |
 | Restoring (e.g. mux)  | `"restoring"`  | no              | yes           | no |
 
 - **Cuts the graph** → makes the combinational graph a DAG (§8.6). Only
   sequential cells do this.
 - **Resets depth** → the consecutive-logic counter restarts on the cell's
   output, so no buffer is inserted right after it (`is_restoration_point()`).
-- **Insertable** → eligible to be the cell the tool *inserts*; must be a
-  1-in/1-out buffer (a mux can't be — it needs a select line).
+- **Insertable** → eligible to be the cell the tool *inserts*; must be a buffer
+  whose every output is the identity of an input (1 lane single-ended, 2 lanes
+  differential — §8.9). A mux can't be — it needs a select line.
 
 **Bringing the flow up on a real vendor CDL.** The sidecar is the only place
 the classification the CDL omits gets injected, so expect to iterate on it:
@@ -476,6 +477,77 @@ the classification the CDL omits gets injected, so expect to iterate on it:
 
 The split matters: **`sequential` decides whether the run *works*; `restoring`
 only decides whether the buffers land in the *right place*.**
+
+### 8.9 Differential libraries — N-lane buffers
+
+Some closed-source PDKs are **differential**: every signal travels as a
+(true, complement) pair, so every cell — including the buffer — has paired I/O.
+The buffer is typically 2-in/2-out (`A, AN → Z, ZN`), never the single-ended
+1-in/1-out cell the early tool assumed. That mismatch surfaces as
+`no buffer cell found` on a differential CDL while sky130 (single-ended) works.
+
+The tool models a buffer as **N identity lanes** rather than 1-in/1-out. A lane
+is a `(in_pin, out_pin)` pair where the output is the *identity* of the input.
+The buffer qualifies when it has an equal, non-zero number of inputs and
+outputs and every output maps to a distinct input this way:
+
+| Buffer            | Lanes                              |
+|-------------------|------------------------------------|
+| single-ended      | `[("A", "Y")]`                     |
+| differential      | `[("A", "Z"), ("AN", "ZN")]`       |
+
+**Lanes are derived from `functions`** — the same data `verify-cdl` already
+needs — so a differential buffer is declared by listing it in `"buffers"` *and*
+giving its identity functions:
+
+```json
+{
+  "buffers": ["BUFD"],
+  "sequential": ["DFFD"],
+  "functions": {
+    "AND2D": { "Z": "(A0 & A1)", "ZN": "(A0N | A1N)" },
+    "BUFD":  { "Z": "A", "ZN": "AN" }
+  }
+}
+```
+
+(A single-ended CDL buffer needs no `functions` entry — a 1-in/1-out cell listed
+in `"buffers"` falls back to one lane automatically.)
+
+**Insertion is by lane chunks.** When a gate exceeds the depth limit, the tool
+buffers its output nets in chunks of `len(lanes)`, emitting one buffer instance
+per chunk. A single-ended buffer (1 lane) therefore drops one instance per
+output net — e.g. a full adder's `SUM` and `COUT` each get their own — while a
+differential buffer drives a true/complement pair through a single instance:
+
+```verilog
+// gate g3 exceeds N; one BUFD carries both phases of its output pair:
+BUFD bb_0 (.A(w3), .Z(_bb_0_), .AN(w3n), .ZN(_bb_1_));
+// the downstream gate is redirected on both phases:
+AND2D g4 (.A0(_bb_0_), .A0N(_bb_1_), .A1(e), .A1N(en), .Z(y), .ZN(yn));
+```
+
+Each lane is an independent identity path, so the true/complement nets are
+paired to lanes positionally — any consistent assignment buffers each net
+correctly, and `verify-cdl` proves it (the stub emits `Z="A"`, `ZN="AN"`, so the
+prover sees both lanes as identities).
+
+> **`graph_builder` records every output phase** as a node attribute
+> (`output_nets`). A `DiGraph` collapses the two parallel edges from a
+> differential gate to a shared consumer into one edge, so the inserter reads
+> the complete phase set from the node, not from `out_edges`.
+
+**The Liberty path gets this for free.** Liberty populates `pin_function` from
+its `function:` attribute, so a differential `.lib` buffer
+(`pin(Z){function:"A";}  pin(ZN){function:"AN";}`) is recognized as a 2-lane
+buffer with no extra code. **Caveat:** this only holds when each complement
+output is the identity of the complement *input* (`ZN = "AN"`). A cell that
+regenerates the complement from a single input (`ZN = "!A"`, a 1-in/2-out cell)
+is *not* an identity lane and won't be classified as a buffer — tag such a cell
+explicitly with `--bb-cell` and `--in-port/--out-port` if you need it.
+
+The single-ended path is a strict special case (N=1), so sky130 results are
+unchanged — `make all` still proves equivalence on 153 cells.
 
 ---
 

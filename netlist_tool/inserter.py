@@ -3,7 +3,7 @@ Depth-aware buffer insertion into a gate-level netlist.
 
 Public API
 ----------
-insert_buffers(module, graph, N, lib, bb_cell, in_port, out_port)  ->  Module
+insert_buffers(module, graph, N, lib, bb_cell, lanes)  ->  Module
 
 Algorithm
 ---------
@@ -14,7 +14,8 @@ Forward depth labeling in topological order.
 A *restoration point* (depth resets to 0 on the output) is:
   - a primary input  (default depth 0; PIs arrive via a strong external driver)
   - a flip-flop / latch  (samples and re-drives — `lib.cell.is_sequential()`)
-  - a buffer cell  (function == input pin — `lib.cell.is_buffer()`)
+  - a buffer cell  (each output is the identity of an input — `is_buffer()`;
+    1 lane single-ended, 2 lanes for a differential A,AN -> Z,ZN buffer)
 
 Inverters do NOT reset depth — they are regular logic stages (`+1`).
 
@@ -142,8 +143,7 @@ def insert_buffers(
     N: int,
     lib: LibParser,
     bb_cell: str = "BLACKBOX",
-    in_port: str = "IN",
-    out_port: str = "OUT",
+    lanes: list[tuple[str, str]] | None = None,
 ) -> Module:
     """Insert buffers so no path has more than N consecutive logic gates
     between restoration points (flip-flops, latches, buffers, primary inputs).
@@ -158,14 +158,26 @@ def insert_buffers(
         Maximum allowed depth (logic-gate count) between restoration points.
     lib:
         LibParser, required to identify sequential cells and buffers.
-    bb_cell, in_port, out_port:
-        Cell type and port names of the buffer to insert.
+    bb_cell:
+        Cell type of the buffer to insert.
+    lanes:
+        Identity lanes of the buffer as [(in_pin, out_pin), ...]: one lane for a
+        single-ended buffer, two for a differential A,AN -> Z,ZN buffer. A gate's
+        output nets are buffered in chunks of `len(lanes)` — so a single-ended
+        buffer drops one buffer per output net (e.g. a full adder's SUM and COUT
+        each get one), while a differential buffer drives a true/complement pair
+        through one instance. Defaults to a single ("IN", "OUT") lane for the
+        library-less placeholder path.
 
     Returns
     -------
     Module
         Deep copy of the input module with buffer instances and wires added.
     """
+    if lanes is None:
+        lanes = [("IN", "OUT")]
+    if not lanes:
+        raise ValueError("lanes must contain at least one (in_pin, out_pin) pair")
     if N < 1:
         raise ValueError(f"N must be >= 1, got {N}")
     if lib is None:
@@ -181,8 +193,10 @@ def insert_buffers(
     # Per-net depth. Missing keys default to 0 (covers PIs, constants, unconnected).
     depth: dict[str, int] = {}
 
-    bb_index = 0
+    bb_index = 0       # counts buffered wires (one per lane)
+    bb_inst_index = 0  # counts inserted buffer instances
     max_depth_seen = 0
+    lane_n = len(lanes)
 
     try:
         topo_order = list(nx.topological_sort(graph))
@@ -201,12 +215,16 @@ def insert_buffers(
 
         cell_info = cells.get(attrs.get("cell_type"))
 
-        # Gather output nets (most std cells have exactly one).
-        output_nets: list[str] = []
-        for _, _, edge_data in graph.out_edges(node, data=True):
-            net = edge_data.get("net", "")
-            if net and net not in output_nets:
-                output_nets.append(net)
+        # Output nets recorded by build_graph (every phase, in pin order). Fall
+        # back to scanning out_edges if the attr is absent (e.g. a hand-built
+        # graph) — that misses phases collapsed into a shared DiGraph edge, but
+        # is fine for the single-output cells such graphs typically hold.
+        output_nets: list[str] = list(attrs.get("output_nets") or [])
+        if not output_nets:
+            for _, _, edge_data in graph.out_edges(node, data=True):
+                net = edge_data.get("net", "")
+                if net and net not in output_nets:
+                    output_nets.append(net)
 
         # Restoration point → outputs at depth 0, no buffering.
         # Covers sequential cells, 1-in/1-out buffers, and `restoring`
@@ -229,45 +247,70 @@ def insert_buffers(
                 depth[n] = out_depth
             continue
 
-        # Threshold exceeded → insert a buffer per output net.
-        for original_net in output_nets:
-            new_wire = f"_bb_{bb_index}_"
-            bb_index += 1
-
-            mod.wires[new_wire] = WireDecl(new_wire)
-
-            bb_inst = Instance(
-                cell_type=bb_cell,
-                name=f"bb_{bb_index - 1}",
-                connections={
-                    in_port: NetRef(original_net),
-                    out_port: NetRef(new_wire),
-                },
+        # Threshold exceeded → buffer the gate's output nets in chunks of
+        # `lane_n`. A single-ended buffer (1 lane) drops one instance per output
+        # net; a differential buffer (2 lanes) drives a true/complement pair
+        # through a single instance. Each lane is an independent identity path,
+        # so nets are paired to lanes positionally — any consistent assignment
+        # buffers each net correctly.
+        if len(output_nets) % lane_n != 0:
+            raise ValueError(
+                f"cannot buffer '{node}' ({attrs.get('cell_type')}): it drives "
+                f"{len(output_nets)} output net(s), not a multiple of buffer "
+                f"'{bb_cell}'s {lane_n} lane(s). A differential buffer needs the "
+                f"gate's outputs to come in matching phase groups. See "
+                f"docs/netlist_editing_workflow.md."
             )
-            mod.instances.append(bb_inst)
 
-            # Redirect gate consumers (port consumers stay on original_net;
-            # the chain ends at a port, so over-shoot by 1 stage is acceptable).
-            # Mutate graph edge attrs to match the new wiring so later
-            # topo-walk visits compute input depth from the buffered net.
+        for chunk_start in range(0, len(output_nets), lane_n):
+            chunk = output_nets[chunk_start : chunk_start + lane_n]
+
+            connections: dict[str, NetRef] = {}
+            # original_net → buffered wire for every net in this chunk.
+            net_remap: dict[str, str] = {}
+            for (in_pin, out_pin), original_net in zip(lanes, chunk):
+                new_wire = f"_bb_{bb_index}_"
+                bb_index += 1
+                mod.wires[new_wire] = WireDecl(new_wire)
+                connections[in_pin] = NetRef(original_net)
+                connections[out_pin] = NetRef(new_wire)
+                net_remap[original_net] = new_wire
+                depth[original_net] = out_depth  # short stub gate→buffer
+                depth[new_wire] = 0              # consumers see fresh signal
+
+            mod.instances.append(
+                Instance(
+                    cell_type=bb_cell,
+                    name=f"bb_{bb_inst_index}",
+                    connections=connections,
+                )
+            )
+            bb_inst_index += 1
+
+            # Redirect gate consumers onto the buffered wires (port consumers
+            # stay on the original net; the chain ends at a port, so over-shoot
+            # by 1 stage is acceptable). A consumer may take several phases from
+            # this gate on different pins, but a DiGraph stores only one edge per
+            # consumer — so match on the connection nets, not the edge's net.
+            # Mutate the edge's net attr too so the later topo-walk computes input
+            # depth from the buffered wire.
             for consumer_node in graph.successors(node):
-                edge_data = graph.edges[node, consumer_node]
-                if edge_data.get("net") != original_net:
-                    continue
                 if graph.nodes[consumer_node].get("kind") != "gate":
                     continue
                 consumer_inst = inst_by_name.get(consumer_node)
                 if consumer_inst is None:
                     continue
                 for pin, ref in list(consumer_inst.connections.items()):
-                    if str(ref) == original_net or ref.name == original_net:
-                        consumer_inst.connections[pin] = NetRef(
-                            new_wire, ref.msb, ref.lsb
-                        )
-                edge_data["net"] = new_wire
-
-            depth[original_net] = out_depth  # short stub between gate and buffer
-            depth[new_wire] = 0              # consumers see fresh signal
+                    new_wire = net_remap.get(str(ref)) or net_remap.get(ref.name)
+                    if new_wire is None:
+                        continue
+                    consumer_inst.connections[pin] = NetRef(
+                        new_wire, ref.msb, ref.lsb
+                    )
+                edge_data = graph.edges[node, consumer_node]
+                remapped = net_remap.get(edge_data.get("net"))
+                if remapped is not None:
+                    edge_data["net"] = remapped
 
     print(f"  Max depth observed: {max_depth_seen} (target ≤ {N})")
     return mod
