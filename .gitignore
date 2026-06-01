@@ -11,8 +11,8 @@
 !*.vhd
 !*.vhdl
 !docs/
-!scripts/
-!scripts/**
+!scripts_&_tests/
+!scripts_&tests/**
 !netlist_tool/
 !netlist_tool/**
 *netlist_tool/__pycache__/
