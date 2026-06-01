@@ -25,3 +25,4 @@
 # Allow .cdl and JSON stubs
 !*.cdl
 !*.cells.json
+scripts_&_tests/lib_to_cdl.py
