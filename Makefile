@@ -201,7 +201,8 @@ verify-cdl: $(NETLIST) $(MODIFIED) $(STUB_LIB) $(FF_MODEL)
 clean:
 	rm -f *.o *.cf *.vcd
 	rm -f $(TB)
-	rm -f $(NETLIST) $(MODIFIED)
+	rm -f $(NETLIST)
+	rm -f $(MODIFIED)
 	rm -f $(STUB_LIB) $(FF_MODEL)
 	rm -rf .cdlcache
 	@echo "Cleaned: object files, config files, waveforms, testbench, and synthesis results"
