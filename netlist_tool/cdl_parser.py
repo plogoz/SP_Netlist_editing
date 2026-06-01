@@ -23,15 +23,22 @@ read a sidecar JSON file:
       "restoring":  ["MUX_TEST"],
       "functions": {
         "AND_TEST": { "Y": "(A & B)" },
-        "INV_TEST": { "Y": "(!A)"    }
-      }
+        "INV_TEST": { "Y": "(!A)"    },
+        "DFF_TEST": { "Q": "D"       }
+      },
+      "clock": { "DFF_TEST": "CLK" }
     }
 
 The `functions` map populates `CellInfo.pin_function` for combinational
 cells, which `emit_stub_lib` then emits as `function : "..."` lines so
-that `equiv_induct` can reason through them. Sequential cells stay
-opaque blackboxes (no `ff()` block); the two-pass `read_liberty` in the
-Makefile keeps them around as bare-blackbox modules.
+that `equiv_induct` can reason through them.
+
+Sequential cells need a `functions` entry (next-state per output) and a
+`clock` entry (their clock pin) too: `emit_ff_model` turns those into a
+behavioural Verilog flop (`always @(posedge CLK) Q <= D;`) that
+`equiv_induct` can reason about. A bare blackbox flop has no FF semantics
+and makes the prover fail with "No SAT model available". See
+docs/netlist_editing_workflow.md §8.10.
 
 `functions` doubles as a *direction* source. Differential CDLs often
 declare every signal pin `:B` (bias/bidirectional — the label LVS and
@@ -245,6 +252,45 @@ def _apply_meta(
         # Recover logical in/out for any pin the CDL left as :B (-> "power").
         _infer_directions_from_functions(cell)
 
+    # Clock pins for sequential cells. emit_ff_model needs to know which pin
+    # clocks each flop to build `always @(posedge <pin>)`; the CDL can't carry
+    # it. {cell_name: clock_pin_name}.
+    clocks = meta.get("clock", {}) or {}
+    if not isinstance(clocks, dict):
+        raise ValueError(
+            f"{meta_source}: 'clock' must be an object, "
+            f"got {type(clocks).__name__}"
+        )
+    for cell_name, pin_name in clocks.items():
+        cell = cells.get(cell_name)
+        if cell is None:
+            print(
+                f"warning: {meta_source}: '{cell_name}' listed under 'clock' "
+                f"but not present in the CDL",
+                file=sys.stderr,
+            )
+            continue
+        if not isinstance(pin_name, str):
+            raise ValueError(
+                f"{meta_source}: clock['{cell_name}'] must be a string pin name, "
+                f"got {type(pin_name).__name__}"
+            )
+        if pin_name not in cell.pins:
+            print(
+                f"warning: {meta_source}: clock['{cell_name}'] = '{pin_name}' "
+                f"is not a pin declared in the CDL",
+                file=sys.stderr,
+            )
+            continue
+        if not cell.is_seq:
+            print(
+                f"warning: {meta_source}: clock['{cell_name}'] is set but the cell "
+                f"is not in 'sequential'; the clock pin is only used for sequential "
+                f"cells (verify-cdl FF model)",
+                file=sys.stderr,
+            )
+        cell.clock_pin = pin_name
+
 
 # ---------------------------------------------------------------------------
 # Multi-input expansion
@@ -313,7 +359,7 @@ class CdlParser:
     more sidecar JSONs. See module docstring for the precedence rules.
     """
 
-    _CACHE_VERSION = 5
+    _CACHE_VERSION = 6
     _CACHE_DIR = Path(".cdlcache")
 
     def __init__(
@@ -458,6 +504,7 @@ class CdlParser:
                     "is_seq": cell.is_seq,
                     "is_buf": cell.is_buf,
                     "is_restoring": cell.is_restoring,
+                    "clock_pin": cell.clock_pin,
                 }
                 for name, cell in self._db.items()
             },
@@ -477,6 +524,7 @@ class CdlParser:
                 is_seq=entry.get("is_seq", False),
                 is_buf=entry.get("is_buf", False),
                 is_restoring=entry.get("is_restoring", False),
+                clock_pin=entry.get("clock_pin"),
             )
             for name, entry in data["cells"].items()
         }
@@ -497,6 +545,7 @@ def emit_stub_lib(
     db: dict[str, CellInfo],
     out_path: str | Path,
     source_name: str = "stub",
+    skip_seq: bool = False,
 ) -> None:
     """Write a minimal Liberty stub from a parsed cell database.
 
@@ -514,11 +563,18 @@ def emit_stub_lib(
       sidecar doesn't carry the clk/D mapping needed to synthesize them.
       For Liberty round-trip this means clk2fflogic won't recognize
       sequential cells from the stub.
+    - `skip_seq`: when True, omit `is_seq` cells entirely. The CDL verify
+      flow sets this and instead defines flops via emit_ff_model (a real
+      behavioural FF that equiv_induct can reason about); leaving them in
+      the stub too would collide with that Verilog module. Default False
+      keeps the Liberty round-trip behaviour (flops stay as blackboxes).
     """
     lines: list[str] = []
     lines.append(f"/* Auto-generated from {source_name} — do not edit. */")
     lines.append("library (cdl_stub) {")
     for name, cell in db.items():
+        if skip_seq and cell.is_seq:
+            continue
         lines.append(f"  cell ({name}) {{")
         outs = cell.output_pins()
         single_in = (
@@ -548,6 +604,86 @@ def emit_stub_lib(
                 lines.append(f"    pin ({pin}) {{ direction : {stub_dir}; }}")
         lines.append("  }")
     lines.append("}")
+    Path(out_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Behavioural FF-model emitter
+# ---------------------------------------------------------------------------
+# Generates a Verilog module per sequential cell so verify-cdl has a real
+# flip-flop equiv_induct can reason about. A bare blackbox flop has no FF
+# semantics — clk2fflogic skips it and equiv_induct dies with "No SAT model
+# available". The model registers each output (next-state from `functions`) on
+# the clock edge; reset/set pins are left unmodelled. Exact reset/edge semantics
+# don't matter for buffer-insertion equivalence: the *same* model sits on both
+# sides of the miter, so it only has to be self-consistent. Cycle-accurate FF
+# semantics remain vendor-LEC's job. See docs/netlist_editing_workflow.md §8.10.
+
+
+def emit_ff_model(
+    db: dict[str, CellInfo],
+    out_path: str | Path,
+    source_name: str = "stub",
+) -> None:
+    """Write a behavioural Verilog model for every sequential cell in `db`.
+
+    One `module` per `is_seq` cell: outputs are `output reg`, every other pin
+    (clock, data, power) is `input`, and the body is one
+    `always @(posedge <clock_pin>) <out> <= <next_state>;` per output, where
+    `<next_state>` is the cell's `functions` expression (Liberty `& | ! ^`
+    operators are valid Verilog, so a plain flop's `"D"` and a more elaborate
+    next-state expression both pass through verbatim).
+
+    Raises ValueError, naming the cell, when a sequential cell lacks a clock pin
+    (sidecar `"clock"` map) or has an output with no `functions` entry — both are
+    required to build a deterministic register.
+    """
+    lines: list[str] = [
+        f"// Auto-generated behavioural FF models from {source_name} — do not edit.",
+        "// One module per sequential cell for verify-cdl; see",
+        "// docs/netlist_editing_workflow.md §8.10.",
+        "",
+    ]
+
+    for name, cell in db.items():
+        if not cell.is_seq:
+            continue
+
+        outs = cell.output_pins()
+        if not outs:
+            raise ValueError(
+                f"sequential cell '{name}' has no output pin; give its output(s) "
+                f"a direction via a 'functions' entry (keys are outputs) so the FF "
+                f"model can register them."
+            )
+        if cell.clock_pin is None:
+            raise ValueError(
+                f"sequential cell '{name}' has no clock pin: add it to the sidecar "
+                f'"clock" map, e.g. "clock": {{"{name}": "CK"}}. The FF model needs '
+                f"it to build `always @(posedge ...)`."
+            )
+        missing = [p for p in outs if p not in cell.pin_function]
+        if missing:
+            raise ValueError(
+                f"sequential cell '{name}': output pin(s) {missing} have no "
+                f"'functions' entry. Each registered output needs its next state, "
+                f'e.g. "functions": {{"{name}": {{"{outs[0]}": "D"}}}}.'
+            )
+
+        ports = list(cell.pins.keys())
+        inputs = [p for p in ports if p not in outs]
+
+        lines.append(f"module {name} ({', '.join(ports)});")
+        if inputs:
+            lines.append(f"  input  {', '.join(inputs)};")
+        lines.append(f"  output reg {', '.join(outs)};")
+        lines.append(f"  always @(posedge {cell.clock_pin}) begin")
+        for out_pin in outs:
+            lines.append(f"    {out_pin} <= {cell.pin_function[out_pin]};")
+        lines.append("  end")
+        lines.append("endmodule")
+        lines.append("")
+
     Path(out_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -590,15 +726,37 @@ def _main(argv: list[str] | None = None) -> int:
         metavar="LIB",
         help="Destination path for the stub Liberty file.",
     )
+    ap.add_argument(
+        "--ff-model",
+        type=Path,
+        default=None,
+        metavar="V",
+        help="Also emit a behavioural Verilog model of the sequential cells to "
+        "this path. When given, the stub omits sequential cells (they are "
+        "defined by the Verilog instead, so verify-cdl gets a real flop "
+        "equiv_induct can reason about). Requires a 'clock' map and 'functions' "
+        "for each sequential cell in the sidecar.",
+    )
     args = ap.parse_args(argv)
 
     parser = CdlParser(args.emit_stub_lib, cell_meta=args.cell_meta)
     db = parser.parse()
-    emit_stub_lib(db, args.output, source_name=parser.source_label)
+    emit_stub_lib(
+        db,
+        args.output,
+        source_name=parser.source_label,
+        skip_seq=args.ff_model is not None,
+    )
     print(
         f"Wrote {args.output} ({len(db)} cells, "
         f"{sum(1 for c in db.values() if c.is_buf)} buffer(s) with function attr)"
     )
+    if args.ff_model is not None:
+        emit_ff_model(db, args.ff_model, source_name=parser.source_label)
+        print(
+            f"Wrote {args.ff_model} "
+            f"({sum(1 for c in db.values() if c.is_seq)} sequential cell model(s))"
+        )
     return 0
 
 

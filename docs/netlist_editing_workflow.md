@@ -228,7 +228,7 @@ Point Python script at closed-source Verilog netlist → run through closed-sour
 - **Approach:** SAT-based equivalence (`equiv_make` + `equiv_induct -seq 10`) on the two netlists merged into a miter circuit. Sequential FFs are translated to combinational logic via `clk2fflogic` + `async2sync` so induction can prove state equivalence in one step.
 - **Why this instead of ngspice:** signal integrity is not a goal on sky130 (that's the closed-source flow's job at tapeout). For the open-source loop we only need to confirm functional equivalence, and EC proves it (rather than testing it) in ~0.1 s. ngspice would also require installing `sky130_fd_pr` transistor primitives and writing a power-aware SPICE writer, since Yosys's `write_spice` output is logic-abstract and not directly simulatable.
 - **Reproducibility:** The same conceptual flow exists in every closed-source EC tool (Cadence Conformal LEC, Synopsys Formality, Mentor Questa Formal). Keep `make verify` as an open-source sanity layer that runs independently of the vendor LEC step.
-- **CDL variant — `make verify-cdl`:** When the input metadata is a `.cdl` (no Liberty available), the recipe first auto-generates a stub `.lib` from the parsed CDL, then runs the same `equiv_make` / `equiv_induct` flow against it. The stub omits `function:` for sequential cells (their Liberty function references internal `ff()` nodes that we don't synthesize), and the Yosys command uses a two-pass `read_liberty` — `-lib` to register blackbox modules for all cells, then `-overwrite` to add function info on top — so flops appear in the design as opaque-but-matching blackboxes while combinational cells and buffers are reasoned about exactly. This proves structural equivalence (the inserted buffers are identity, the rest is unchanged); cycle-level FF semantics are still left to vendor LEC. Full rationale in [docs/cdl_backend.md](cdl_backend.md).
+- **CDL variant — `make verify-cdl`:** When the input metadata is a `.cdl` (no Liberty available), the recipe auto-generates two temporary files from the parsed CDL — a stub `.lib` for the combinational cells and a behavioural Verilog **FF model** for the sequential cells — then runs the `equiv_make` / `equiv_induct` flow against them. Combinational cells and buffers are reasoned about exactly via their `function:`; sequential cells are emitted as real `always @(posedge CLK) Q <= D;` flops so `equiv_induct` can do its temporal induction. (An earlier design left flops as functionless blackboxes; that fails — `equiv_induct` cannot model a blackbox flop and aborts with *No SAT model available*. See §8.10.) This proves structural equivalence (the inserted buffers are identity, the rest is unchanged); cycle-accurate FF semantics are still left to vendor LEC. Full rationale in [docs/cdl_backend.md](cdl_backend.md).
 
 ### 5.6 Surfer — Waveform Viewer
 
@@ -321,7 +321,7 @@ read_liberty -lib                         $(STUB_LIB)
 read_liberty -ignore_miss_func -overwrite $(STUB_LIB)
 ```
 
-The first pass registers every cell as an empty blackbox module (port directions only) — required because sequential cells in the stub intentionally carry no `function:`, and a single-pass `read_liberty -ignore_miss_func` would drop them entirely. The second pass upgrades the cells that *do* have a function (combinational cells plus tagged buffers) with their function expression. Flops then appear as opaque-but-matching blackboxes on both sides of the miter, buffers are recognized as identity, and the existing `equiv_make` / `equiv_induct` pipeline converges.
+The first pass registers every cell as an empty blackbox module (port directions only) — required because functionless cells in the stub (physical cells like end-caps/fillers, and any cell left uncharacterised) would be dropped by a single-pass `read_liberty -ignore_miss_func`. The second pass upgrades the cells that *do* have a function (combinational cells plus tagged buffers) with their function expression. Physical cells stay as opaque-but-matching blackboxes on both sides of the miter, buffers are recognized as identity. **Sequential cells are not in the stub at all** — they are excluded (`--ff-model` implies `skip_seq`) and supplied separately as behavioural Verilog flops (§8.10), because a functionless blackbox flop makes `equiv_induct` abort. With those pieces the `equiv_make` / `equiv_induct` pipeline converges.
 
 ### 8.4 Validation
 
@@ -584,6 +584,79 @@ explicitly with `--bb-cell` and `--in-port/--out-port` if you need it.
 
 The single-ended path is a strict special case (N=1), so sky130 results are
 unchanged — `make all` still proves equivalence on 153 cells.
+
+### 8.10 Sequential cells — behavioural FF models
+
+`equiv_induct` does temporal induction and must treat each flop as a **real
+state element**. A functionless blackbox flop has no FF semantics:
+`clk2fflogic` skips it and the prover aborts with
+`No SAT model available for cell … (DFF_…)`. So `verify-cdl` does **not** leave
+flops as blackboxes — it generates a behavioural Verilog model for them.
+
+Two sidecar fields drive this, both required per sequential cell:
+
+```json
+"sequential": ["DFFD"],
+"functions":  { "DFFD": { "Q": "D", "QN": "DN" } },
+"clock":      { "DFFD": "CK" }
+```
+
+- **`functions`** — next state per output (`Q<=D`, `QN<=DN`). A bare pin for a
+  plain flop; any `& | ! ^` expression also works (those are Verilog operators
+  too). The keys also give the outputs a direction via the usual `:B` inference
+  (§8.9).
+- **`clock`** — the clock pin, the one thing the CDL and the `functions` can't
+  supply. `{cell: pin}`.
+
+`emit_ff_model` (`cdl_parser.py`) turns each into one module:
+
+```verilog
+module DFFD (CK, D, DN, Q, QN);
+  input  CK, D, DN;
+  output reg Q, QN;
+  always @(posedge CK) begin Q <= D; QN <= DN; end
+endmodule
+```
+
+`emit_stub_lib` is called with `skip_seq=True` (implied by `--ff-model`) so the
+flop is **not** also in the stub `.lib` — the Verilog module is its sole
+definition (a duplicate would collide). The `verify-cdl` Yosys script gains
+`read_verilog $(FF_MODEL)` and a `proc` pass (to lower the always-block to a
+`$_DFF_`) before `clk2fflogic`.
+
+The model is applied **identically to gold and gate**, so exact reset/edge
+semantics don't affect the buffer-insertion proof — only self-consistency
+matters. Posedge is assumed and reset/set pins are left unmodelled; cycle-
+accurate FF semantics remain vendor-LEC's job. Latches (also `is_seq`) are
+modelled as posedge flops — acceptable for structural equivalence.
+
+**Temporary files.** Both `$(STUB_LIB)` and `$(FF_MODEL)` are regenerated each
+run and removed by a cleanup `trap … EXIT` around the Yosys call, so they are
+deleted on success *and* failure (the old trailing `rm` leaked on a failed
+proof). Bootstrapping a sidecar from Liberty? `scripts/lib_to_cdl.py` grows a
+`--clock CELL=PIN` flag (the clock can't be derived from Liberty here, same as
+`--restoring`).
+
+### 8.11 `verify-cdl` cell-coverage checklist
+
+`equiv_induct`/`hierarchy` need every instantiated cell accounted for. Common
+bring-up failures and their cause:
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `Module '…' … is not part of the design` (at `hierarchy`) | A cell in the netlist (often a **physical** cell: end-cap, antenna, fill, tap, decap) is absent from the CDL set | Add its CDL to `CDL=` (the backend merges a directory), or a minimal empty `.SUBCKT` stub |
+| `No SAT model available for cell … (<comb cell>)` | A **combinational** cell (incl. **clock/CTS buffers**) the prover must traverse has no `function:` | Give it a `functions` entry (a clock buffer is identity: `{"Z":"A"}`) |
+| `No SAT model available for cell … (DFF_…)` | A **flop** left as a functionless blackbox | Give it `functions` + `clock` so it gets a behavioural model (§8.10) |
+
+Rule of thumb: **every combinational cell needs a `function`; every sequential
+cell needs `functions` + `clock`; physical cells only need to *exist* as
+blackboxes.** Transmission gates are not Boolean functions (bidirectional +
+high-Z): model an always-on pass gate as a buffer, otherwise treat it as part
+of the mux/latch it builds and leave the bare cell out of `functions`.
+
+For the differential `functions` convention itself (true output as a positive
+`& | ^` formula; complement output as `!(…)` over the complement input rails;
+inverting cells = the non-inverting twin with the two outputs swapped) see §8.9.
 
 ---
 

@@ -56,6 +56,7 @@ endif
 CDL       ?= TEST_CELLS.cdl
 CELL_META ?= TEST_CELLS.cells.json
 STUB_LIB  ?= cdl_stub.lib
+FF_MODEL  ?= cdl_ff_model.v
 
 # ============================================================================
 # Help
@@ -83,7 +84,7 @@ help:
 	@echo "  VHDL=$(VHDL)  TOP=$(TOP)  TB=$(TB)"
 	@echo "  NETLIST=$(NETLIST)  MODIFIED=$(MODIFIED)"
 	@echo "  N_BUFF=$(N_BUFF)  LIB=$(LIB)"
-	@echo "  CDL=$(CDL)  CELL_META=$(CELL_META)  STUB_LIB=$(STUB_LIB)"
+	@echo "  CDL=$(CDL)  CELL_META=$(CELL_META)  STUB_LIB=$(STUB_LIB)  FF_MODEL=$(FF_MODEL)"
 	@echo "  GHDL_PREFIX=$(GHDL_PREFIX)"
 	@echo ""
 	@echo "Examples:"
@@ -163,18 +164,29 @@ editing-cdl:
 	uv run python -m netlist_tool $(NETLIST) $(MODIFIED) \
 	    --N $(N_BUFF) --cdl $(CDL) --cell-meta $(CELL_META)
 
-$(STUB_LIB): $(CDL) $(CELL_META)
+# One invocation emits the combinational-cell stub AND the behavioural FF model:
+# sequential cells are omitted from the stub (--ff-model implies skip_seq) and
+# defined in $(FF_MODEL) instead, so equiv_induct sees a real flop rather than a
+# functionless blackbox (which it cannot model — "No SAT model available").
+# Grouped target (&:) so the single command satisfies both prerequisites.
+$(STUB_LIB) $(FF_MODEL) &: $(CDL) $(CELL_META)
 	uv run python -m netlist_tool.cdl_parser --emit-stub-lib $(CDL) \
-	    --cell-meta $(CELL_META) -o $@
+	    --cell-meta $(CELL_META) -o $(STUB_LIB) --ff-model $(FF_MODEL)
 
-verify-cdl: $(NETLIST) $(MODIFIED) $(STUB_LIB)
+# The cleanup trap removes the generated stub + FF model + cache on EXIT —
+# success OR failure — so these temporaries never accumulate (the old trailing
+# `rm` only ran on success and leaked on a failed proof).
+verify-cdl: $(NETLIST) $(MODIFIED) $(STUB_LIB) $(FF_MODEL)
+	@trap 'rm -f $(STUB_LIB) $(FF_MODEL); rm -rf .cdlcache' EXIT; \
 	yosys -p "\
 		read_liberty -lib $(STUB_LIB); \
 		read_liberty -ignore_miss_func -overwrite $(STUB_LIB); \
+		read_verilog $(FF_MODEL); \
 		read_verilog $(NETLIST); \
 		rename $(TOP) gold; \
 		read_verilog $(MODIFIED); \
 		rename $(TOP) gate; \
+		proc; \
 		equiv_make gold gate equiv; \
 		hierarchy -top equiv; \
 		clk2fflogic; \
@@ -182,8 +194,6 @@ verify-cdl: $(NETLIST) $(MODIFIED) $(STUB_LIB)
 		prep -flatten; \
 		equiv_induct -seq 10; \
 		equiv_status -assert"
-		rm -f $(STUB_LIB)
-		rm -rf .cdlcache
 # ============================================================================
 # Clean
 # ============================================================================
@@ -192,6 +202,6 @@ clean:
 	rm -f *.o *.cf *.vcd
 	rm -f $(TB)
 	rm -f $(NETLIST) $(MODIFIED)
-	rm -f $(STUB_LIB)
+	rm -f $(STUB_LIB) $(FF_MODEL)
 	rm -rf .cdlcache
 	@echo "Cleaned: object files, config files, waveforms, testbench, and synthesis results"

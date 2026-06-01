@@ -77,7 +77,11 @@ def _emit_cdl(db: dict[str, CellInfo], source_name: str) -> str:
     return "\n".join(lines)
 
 
-def _emit_sidecar(db: dict[str, CellInfo], restoring: list[str] | None = None) -> dict:
+def _emit_sidecar(
+    db: dict[str, CellInfo],
+    restoring: list[str] | None = None,
+    clock: dict[str, str] | None = None,
+) -> dict:
     buffers: list[str] = []
     sequential: list[str] = []
     functions: dict[str, dict[str, str]] = {}
@@ -89,8 +93,10 @@ def _emit_sidecar(db: dict[str, CellInfo], restoring: list[str] | None = None) -
             buffers.append(name)
         if not cell.is_seq and cell.pin_function:
             # Only carry the function strings for cells we're willing to
-            # characterise. Sequential cells stay opaque; emit_stub_lib
-            # would drop their function anyway. Restoring cells keep their
+            # characterise. A Liberty flop's function references internal ff()
+            # nodes (e.g. "IQ") that are not pins, so it's useless to the CDL
+            # FF model — sequential next-state + clock are added manually
+            # (--clock), just like --restoring. Restoring cells keep their
             # function here so verify-cdl can still reason through them.
             functions[name] = dict(cell.pin_function)
 
@@ -105,11 +111,23 @@ def _emit_sidecar(db: dict[str, CellInfo], restoring: list[str] | None = None) -
                 file=sys.stderr,
             )
 
+    # `clock` likewise can't be derived here (it would need ff().clocked_on
+    # parsing in lib_parser), so it is supplied explicitly via --clock CELL=PIN.
+    clock = clock or {}
+    for name in clock:
+        if name not in db:
+            print(
+                f"warning: --clock '{name}' is not a cell in the parsed "
+                "Liberty; emitting it anyway",
+                file=sys.stderr,
+            )
+
     return {
         "buffers": sorted(buffers),
         "sequential": sorted(sequential),
         "restoring": sorted(set(restoring)),
         "functions": dict(sorted(functions.items())),
+        "clock": dict(sorted(clock.items())),
     }
 
 
@@ -145,7 +163,26 @@ def main(argv: list[str] | None = None) -> int:
         "not cut the graph. Cannot be derived from Liberty, so it is listed "
         "explicitly. Example: --restoring sky130_fd_sc_hd__mux2_1",
     )
+    ap.add_argument(
+        "--clock",
+        nargs="*",
+        default=[],
+        metavar="CELL=PIN",
+        help="Clock-pin assignments for sequential cells, used by verify-cdl's "
+        "behavioural FF model. Cannot be derived from Liberty here, so listed "
+        "explicitly. Example: --clock sky130_fd_sc_hd__dfxtp_1=CLK",
+    )
     args = ap.parse_args(argv)
+
+    clock: dict[str, str] = {}
+    for item in args.clock:
+        if "=" not in item:
+            print(
+                f"error: --clock entry '{item}' must be CELL=PIN", file=sys.stderr
+            )
+            return 1
+        cell_name, pin_name = item.split("=", 1)
+        clock[cell_name] = pin_name
 
     if not args.lib.exists():
         print(f"error: {args.lib}: not found", file=sys.stderr)
@@ -164,14 +201,15 @@ def main(argv: list[str] | None = None) -> int:
     cdl_out.write_text(cdl_text, encoding="utf-8")
     print(f"Wrote {cdl_out}")
 
-    sidecar = _emit_sidecar(db, restoring=args.restoring)
+    sidecar = _emit_sidecar(db, restoring=args.restoring, clock=clock)
     sidecar_out.write_text(json.dumps(sidecar, indent=2) + "\n", encoding="utf-8")
     print(
         f"Wrote {sidecar_out} "
         f"(buffers={len(sidecar['buffers'])}, "
         f"sequential={len(sidecar['sequential'])}, "
         f"restoring={len(sidecar['restoring'])}, "
-        f"functions={len(sidecar['functions'])})"
+        f"functions={len(sidecar['functions'])}, "
+        f"clock={len(sidecar['clock'])})"
     )
 
     return 0

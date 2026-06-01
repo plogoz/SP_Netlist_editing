@@ -4,6 +4,8 @@
   "functions": {
     "AND_TEST": { "Y": "(A & B)" },
     "OR_TEST":  { "Y": "(A | B)" },
-    "INV_TEST": { "Y": "(!A)" }
-  }
+    "INV_TEST": { "Y": "(!A)" },
+    "DFF_TEST": { "Q": "D" }
+  },
+  "clock": { "DFF_TEST": "CLK" }
 }

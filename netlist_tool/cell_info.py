@@ -36,6 +36,10 @@ class CellInfo:
     # (depth resets on its output) but is NOT a 1-in/1-out insertion buffer and
     # does NOT cut the graph — the loop it sits on is broken at a sequential
     # cell. Liberty path leaves this False.
+    clock_pin: str | None = None  # sidecar "clock" map (CDL only): the clock pin
+    # of a sequential cell. Consumed only by emit_ff_model (verify-cdl) to build
+    # `always @(posedge <clock_pin>)`; the insertion path never reads it. Liberty
+    # path leaves this None.
 
     def signal_pins(self) -> dict[str, str]:
         """Signal pins only (excludes power/ground)."""
