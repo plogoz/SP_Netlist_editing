@@ -630,6 +630,12 @@ matters. Posedge is assumed and reset/set pins are left unmodelled; cycle-
 accurate FF semantics remain vendor-LEC's job. Latches (also `is_seq`) are
 modelled as posedge flops — acceptable for structural equivalence.
 
+**Differential clocks** need nothing special: name the true rail in `"clock"`
+(`posedge CK` is the same instant as `negedge CKB`); the complement rail `CKB`
+is a non-output pin, so it is declared as an unused `input` and ignored. A fully
+differential flop (clock `CK/CKB`, data `D/DN`, outputs `Q/QN`) proves
+equivalent unchanged.
+
 **Temporary files.** Both `$(STUB_LIB)` and `$(FF_MODEL)` are regenerated each
 run and removed by a cleanup `trap … EXIT` around the Yosys call, so they are
 deleted on success *and* failure (the old trailing `rm` leaked on a failed
@@ -647,6 +653,7 @@ bring-up failures and their cause:
 | `Module '…' … is not part of the design` (at `hierarchy`) | A cell in the netlist (often a **physical** cell: end-cap, antenna, fill, tap, decap) is absent from the CDL set | Add its CDL to `CDL=` (the backend merges a directory), or a minimal empty `.SUBCKT` stub |
 | `No SAT model available for cell … (<comb cell>)` | A **combinational** cell (incl. **clock/CTS buffers**) the prover must traverse has no `function:` | Give it a `functions` entry (a clock buffer is identity: `{"Z":"A"}`) |
 | `No SAT model available for cell … (DFF_…)` | A **flop** left as a functionless blackbox | Give it `functions` + `clock` so it gets a behavioural model (§8.10) |
+| A handful of `Unproven $equiv … \_bb_N__gate 1'x` + *"Circuit inherently diverges!"* (most cells prove) | An inserted buffer landed on a **bus-bit** net and was mis-referenced as `_bb_N_[i]` — an out-of-range select on the 1-bit buffer wire, read as `x` | Fixed in `inserter.py`: the redirect references the scalar buffer wire by its own name. See §8.12 |
 
 Rule of thumb: **every combinational cell needs a `function`; every sequential
 cell needs `functions` + `clock`; physical cells only need to *exist* as
@@ -657,6 +664,82 @@ of the mux/latch it builds and leave the bare cell out of `functions`.
 For the differential `functions` convention itself (true output as a positive
 `& | ^` formula; complement output as `!(…)` over the complement input rails;
 inverting cells = the non-inverting twin with the two outputs swapped) see §8.9.
+
+### 8.12 Bus-bit nets — buffer-wire identity
+
+The insertion pipeline rests on one assumption the gate level always satisfies:
+**every cell pin is a single bit**, so each net a buffer touches is one bit and
+the buffer wire is a fresh *scalar*. Connectivity is reasoned about per bit:
+`graph_builder._resolve_net` canonicalises every connection to one of three
+spellings —
+
+| Resolved key   | Meaning            | Bits |
+|----------------|--------------------|------|
+| `name`         | scalar / whole net | 1    |
+| `name[i]`      | single-bit select  | 1    |
+| `name[hi:lo]`  | range select       | many |
+
+This mirrors how the real tools model nets — connectivity is bit-level, and a
+bus is only a *declaration* over those bits. In Yosys/RTLIL the atomic object is
+a `SigBit` = `(Wire, offset)`; cell ports connect to a `SigSpec` (a bit vector);
+inserting a buffer means replacing the bit in each consumer's `SigSpec`
+(`SigSpec::replace`). Commercial DBs (OpenAccess-style, used by Genus/Innovus)
+make each bit a first-class **scalar net** named `w[2]`, grouped under a bus
+`w`. In both, the writer asks each net for *its own name* — a scalar's name is
+`_bb_0_`, a bus bit's name is `w[2]` — so neither can ever emit `_bb_0_[2]`,
+because no object is "bit 2 of the scalar `_bb_0_`".
+
+**The bug this section fixed.** When a buffered net was a bus bit (e.g. `w[2]`),
+the consumer-redirect built the replacement reference by name-swapping the new
+wire onto the consumer's *old* `NetRef` while **keeping its bit-select**:
+
+```python
+NetRef(new_wire, ref.msb, ref.lsb)   # -> _bb_0_[2]  (msb/lsb belonged to bus w)
+```
+
+`_bb_0_` is a 1-bit wire, so `_bb_0_[2]` is an out-of-range select that Yosys
+reads as `x`. The base case of `equiv_induct` then can't prove the buffered net
+equals its source, and the run aborts with *"Circuit inherently diverges!"* and
+an unproven `\_bb_N__gate 1'x` per affected wire. Two traps in reading that
+output:
+
+- **It looks global but is local.** Only buffers that land on bus bits break;
+  buffers on scalar nets had `ref.msb is None`, so they copied `None,None` and
+  serialised correctly. A design with mostly scalar intermediate nets shows just
+  a few unproven cells (a differential pair fails as two consecutive
+  `_bb_N_/_bb_N+1_`), while thousands prove.
+- **It is not a name collision.** `equiv_make` names the checkpoint after the
+  *gate-side* net at a matched cell's input (`\_bb_455__gate`); it does **not**
+  require `_bb_455_` to exist in the gold netlist. Grepping the original netlist
+  for the reported name finds nothing — that is expected, not a second bug.
+
+**The fix** is the bit-replacement the real tools do: reference the scalar
+buffer wire by its own name, dropping the source bus's select. The mapping
+`net_remap` already holds the right identity (`"w[2]" → "_bb_0_"`):
+
+```python
+NetRef(new_wire)   # connect the pin to the scalar net _bb_0_, by its own name
+```
+
+**The guard** makes the single-bit assumption a checked invariant rather than an
+implicit one. `inserter._is_multibit_net` rejects a `name[hi:lo]` output net
+before any wiring happens:
+
+```
+ValueError: cannot buffer 'g2' (AND_TEST): its output net 'y[1:0]' selects
+multiple bits, but a buffer lane drives a single-bit wire. …
+```
+
+Multi-bit cell output pins don't occur in a gate-level netlist, so this never
+fires in practice — but if a design ever carries one, the tool stops loudly at
+the source instead of emitting a netlist that diverges thousands of cells later.
+
+> **Regression coverage.** The pre-existing fixtures (`diff_*`, `fsm`,
+> `TEST_CELLS`) are all scalar at the buffered net, which is why this shipped. A
+> minimal bus-bit netlist (a chain driving `w[0..2]` with `N=2`, so the third
+> gate's bus-bit output is buffered) reproduces the divergence before the fix
+> and proves after it; keep such a fixture in the verify loop so the class can't
+> regress.
 
 ---
 

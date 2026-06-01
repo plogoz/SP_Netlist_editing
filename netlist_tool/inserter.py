@@ -137,6 +137,23 @@ def _diagnose_cycle(graph: nx.DiGraph, cells: dict) -> None:
         )
 
 
+def _is_multibit_net(net_key: str) -> bool:
+    """True if a resolved net key selects more than one bit (a `[hi:lo]` range).
+
+    graph_builder._resolve_net produces one of three spellings:
+      - ``name``         (scalar / whole net)      — single bit here
+      - ``name[i]``      (single-bit select)        — single bit
+      - ``name[hi:lo]``  (range select)             — multi-bit
+
+    Buffer lanes drive a single-bit scalar wire, so only the range form is a
+    problem: one scalar `_bb_N_` cannot carry several bits. This is the checked
+    form of the tool's core assumption — gate-level cell pins are 1-bit — so a
+    multi-bit output pin fails loudly instead of mis-wiring silently.
+    """
+    i = net_key.rfind("[")
+    return i != -1 and ":" in net_key[i:]
+
+
 def insert_buffers(
     module: Module,
     graph: nx.DiGraph,
@@ -269,6 +286,15 @@ def insert_buffers(
             # original_net → buffered wire for every net in this chunk.
             net_remap: dict[str, str] = {}
             for (in_pin, out_pin), original_net in zip(lanes, chunk):
+                if _is_multibit_net(original_net):
+                    raise ValueError(
+                        f"cannot buffer '{node}' ({attrs.get('cell_type')}): its "
+                        f"output net '{original_net}' selects multiple bits, but a "
+                        f"buffer lane drives a single-bit wire. Multi-bit cell "
+                        f"output pins don't occur in a gate-level netlist; if this "
+                        f"is real, the design must be split so each bit is buffered "
+                        f"separately. See docs/netlist_editing_workflow.md."
+                    )
                 new_wire = f"_bb_{bb_index}_"
                 bb_index += 1
                 mod.wires[new_wire] = WireDecl(new_wire)
@@ -304,9 +330,14 @@ def insert_buffers(
                     new_wire = net_remap.get(str(ref)) or net_remap.get(ref.name)
                     if new_wire is None:
                         continue
-                    consumer_inst.connections[pin] = NetRef(
-                        new_wire, ref.msb, ref.lsb
-                    )
+                    # The buffered wire is a fresh *scalar* carrying exactly the
+                    # one bit `ref` selected. Reference it by its own name with no
+                    # bit-select: ref.msb/lsb belonged to the source bus (e.g.
+                    # w[2]), and copying it here would emit `_bb_N_[2]` — an
+                    # out-of-range select on a 1-bit wire that Yosys reads as x,
+                    # making equiv_induct diverge on that net. (Scalar source nets
+                    # had msb=None, which is why only bus bits were affected.)
+                    consumer_inst.connections[pin] = NetRef(new_wire)
                 edge_data = graph.edges[node, consumer_node]
                 remapped = net_remap.get(edge_data.get("net"))
                 if remapped is not None:
