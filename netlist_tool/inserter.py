@@ -161,6 +161,7 @@ def insert_buffers(
     lib: LibParser,
     bb_cell: str = "BLACKBOX",
     lanes: list[tuple[str, str]] | None = None,
+    supplies: dict[str, str] | None = None,
 ) -> Module:
     """Insert buffers so no path has more than N consecutive logic gates
     between restoration points (flip-flops, latches, buffers, primary inputs).
@@ -185,6 +186,11 @@ def insert_buffers(
         each get one), while a differential buffer drives a true/complement pair
         through one instance. Defaults to a single ("IN", "OUT") lane for the
         library-less placeholder path.
+    supplies:
+        Resolved {power_pin: rail_net} map (from supplies.resolve_supply_connections).
+        Each inserted buffer instance also connects these power pins to the named
+        netlist rails, so its supply pins don't float. Empty/None (the Liberty
+        flow, whose cells expose no power pins) leaves instances exactly as before.
 
     Returns
     -------
@@ -206,6 +212,12 @@ def insert_buffers(
     cells = lib.parse()
     mod = copy.deepcopy(module)
     inst_by_name: dict[str, Instance] = {inst.name: inst for inst in mod.instances}
+
+    # Supply rails are global, so every inserted buffer connects the same power
+    # pins to the same nets. Build the NetRefs once. Empty for the Liberty flow.
+    supply_conns: dict[str, NetRef] = {
+        pin: NetRef(net) for pin, net in (supplies or {}).items()
+    }
 
     # Per-net depth. Missing keys default to 0 (covers PIs, constants, unconnected).
     depth: dict[str, int] = {}
@@ -303,6 +315,10 @@ def insert_buffers(
                 net_remap[original_net] = new_wire
                 depth[original_net] = out_depth  # short stub gate→buffer
                 depth[new_wire] = 0              # consumers see fresh signal
+
+            # Tie the buffer's supply pins to the netlist rails (full-custom CDL
+            # flow); empty for Liberty, leaving the instance unchanged.
+            connections.update(supply_conns)
 
             mod.instances.append(
                 Instance(

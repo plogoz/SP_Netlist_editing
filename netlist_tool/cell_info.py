@@ -51,6 +51,15 @@ class CellInfo:
     def output_pins(self) -> list[str]:
         return [p for p, d in self.pins.items() if d == "output"]
 
+    def power_pins(self) -> list[str]:
+        """Supply/bias/ground pins (Liberty pg_pins, CDL `:B` left as power).
+
+        Liberty's parser does not capture pg_pins, so this is empty for the
+        sky130 flow; CDL `:B` pins not named in a `functions` expression survive
+        as power and are returned here. Used to wire inserted buffers' supply
+        pins to the netlist rails (see netlist_tool/supplies.py)."""
+        return [p for p, d in self.pins.items() if d == "power"]
+
     def is_sequential(self) -> bool:
         """True iff this cell holds state (FF or latch)."""
         return self.is_seq

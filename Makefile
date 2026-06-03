@@ -34,6 +34,9 @@
 #   CELL_META  Sidecar JSON(s) flagging buffer / sequential cells.
 #              Omit to auto-discover <stem>.cells.json next to each CDL.
 #   STUB_LIB   Auto-generated Liberty stub consumed by `verify-cdl`.
+#   SUPPLIES   Netlist-paired supply sidecar {"rails":{pin:net}} wiring inserted
+#              buffers' power pins to top-level rails (full-custom CDL flow).
+#              Omit to auto-discover <netlist_stem>.supplies.json next to NETLIST.
 
 VHDL       ?= fsm.vhdl
 TOP        ?= flip_flop_adder
@@ -57,6 +60,7 @@ CDL       ?= TEST_CELLS.cdl
 CELL_META ?= TEST_CELLS.cells.json
 STUB_LIB  ?= cdl_stub.lib
 FF_MODEL  ?= cdl_ff_model.v
+SUPPLIES  ?=
 
 # ============================================================================
 # Help
@@ -85,6 +89,7 @@ help:
 	@echo "  NETLIST=$(NETLIST)  MODIFIED=$(MODIFIED)"
 	@echo "  N_BUFF=$(N_BUFF)  LIB=$(LIB)"
 	@echo "  CDL=$(CDL)  CELL_META=$(CELL_META)  STUB_LIB=$(STUB_LIB)  FF_MODEL=$(FF_MODEL)"
+	@echo "  SUPPLIES=$(SUPPLIES)"
 	@echo "  GHDL_PREFIX=$(GHDL_PREFIX)"
 	@echo ""
 	@echo "Examples:"
@@ -128,7 +133,8 @@ net: # synthesis with SkyWater130nm mapping
 # ============================================================================
 
 editing:
-	uv run python -m netlist_tool $(NETLIST) $(MODIFIED) --N $(N_BUFF) --lib $(LIB)
+	uv run python -m netlist_tool $(NETLIST) $(MODIFIED) --N $(N_BUFF) --lib $(LIB) \
+	    $(if $(SUPPLIES),--supplies $(SUPPLIES),)
 
 visualize:
 	uv run python -m netlist_tool $(NETLIST) $(MODIFIED) --N $(N_BUFF) --visualize
@@ -162,7 +168,8 @@ all : clean net editing verify
 
 editing-cdl:
 	uv run python -m netlist_tool $(NETLIST) $(MODIFIED) \
-	    --N $(N_BUFF) --cdl $(CDL) --cell-meta $(CELL_META)
+	    --N $(N_BUFF) --cdl $(CDL) --cell-meta $(CELL_META) \
+	    $(if $(SUPPLIES),--supplies $(SUPPLIES),)
 
 # One invocation emits the combinational-cell stub AND the behavioural FF model:
 # sequential cells are omitted from the stub (--ff-model implies skip_seq) and

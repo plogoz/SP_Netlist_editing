@@ -741,6 +741,52 @@ the source instead of emitting a netlist that diverges thousands of cells later.
 > and proves after it; keep such a fixture in the verify loop so the class can't
 > regress.
 
+### 8.13 Supply rails on inserted buffers — the netlist-paired sidecar
+
+In the full-custom CDL flow the cells expose **dedicated supply/bias pins**
+(`VDD`, `VSS`, `BIAS_P`, …) that the synthesized Verilog wires to **top-level
+rail ports** of the same name set. Synthesis already wires the original
+instances, and the parse/serialize round-trip preserves them — but the buffers
+`inserter.py` inserts wired only their identity lanes, leaving every `bb_N`
+buffer's supply pins **floating** (a contributor to SPICE
+`Floating (no DC path to gnd) gate`). The fix wires those pins from a sidecar.
+
+The mapping is **netlist-specific** (the rail *port names* vary per netlist), so
+it lives next to the netlist as `<netlist_stem>.supplies.json`, not in the
+library `.cdl` sidecar (reused across netlists) nor the Makefile (build-tool
+data is the wrong altitude). It is consumed **only by `netlist_tool`** — the
+`.v`→`.sp` converter does not read it.
+
+```json
+{ "rails": { "VDD": "vdd", "VSS": "vss", "BIAS_P": "bias_p" } }
+```
+
+Left = supply **pin name** on the cells (uniform across the library); right =
+the **top-level net** in this netlist. Auto-discovered next to the input
+netlist; override with `--supplies PATH` (or `SUPPLIES=` in the Makefile).
+
+- **Liberty is a natural no-op.** `lib_parser` does not parse `pg_pin`s
+  (`_TOKEN_RE`, intentionally), so sky130 cells carry no power pins and
+  `supplies.resolve_supply_connections` returns an empty map — the inserted
+  `buf_1` keeps just `.A`/`.X`, and `verify` is unaffected. Enabling pg_pin
+  parsing would add supply pins the gold cells lack and break the miter, so it
+  stays off. For CDL, `:B`→`power` pins **not** named in a `functions`
+  expression (i.e. genuine supplies) survive as power and get wired (§8.9).
+- **Validation is fail-fast** (`supplies.resolve_supply_connections`): a buffer
+  power pin with no `rails` entry (it would float) or a rail mapped to a net not
+  declared in the module is a hard error naming the offender — nothing is
+  written. A `rails` entry that matches no power pin of the chosen buffer is a
+  warning (typo / shared map).
+- **`verify-cdl` still proves.** `emit_stub_lib` emits power pins as
+  `direction : input`, so the buffer's `.VDD/.VSS` connections resolve and the
+  extra inputs don't affect the identity function — `equiv_induct` converges.
+
+> **Regression + coverage.** Existing fixtures (`diff_*`, `fsm`, `TEST_CELLS`)
+> carry no `.supplies.json`, so they exercise the no-op path unchanged. The
+> `SUPPLY_TEST` fixture (a `BUFD` with `:B` `VDD`/`VSS` pins + a netlist with
+> `vdd`/`vss` top ports + `supply_netlist.supplies.json`) checks that the
+> inserted buffer gains `.VDD(vdd)`/`.VSS(vss)` and still proves equivalent.
+
 ---
 
 ## 9. Next Steps

@@ -98,6 +98,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "explicitly (one master file or a list) to override auto-discovery.",
     )
     p.add_argument(
+        "--supplies",
+        type=Path,
+        default=None,
+        metavar="JSON",
+        help="Netlist-paired supply sidecar {\"rails\": {pin: net}} mapping each "
+        "cell supply pin to a top-level rail net, so inserted buffers' power pins "
+        "are wired (full-custom CDL flow). Omit to auto-discover "
+        "<netlist_stem>.supplies.json next to the input netlist.",
+    )
+    p.add_argument(
         "--visualize",
         nargs="?",
         const=True,
@@ -240,6 +250,27 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
+    # Resolve supply rails for the inserted buffers (full-custom CDL flow). The
+    # sidecar is netlist-paired: explicit --supplies, else auto-discovered next
+    # to the input netlist. Liberty cells expose no power pins, so this resolves
+    # to an empty map and instances are unchanged.
+    from .supplies import discover_supplies, load_supplies, resolve_supply_connections
+
+    supply_path = args.supplies or discover_supplies(args.input)
+    supply_conns: dict[str, str] = {}
+    if supply_path is not None:
+        try:
+            rails = load_supplies(supply_path)
+            supply_conns = resolve_supply_connections(
+                rails, args.bb_cell, lib.parse(), module, source=str(supply_path)
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        if supply_conns:
+            applied = ", ".join(f"{pin}→{net}" for pin, net in supply_conns.items())
+            print(f"\nSupply rails from {supply_path}: {applied}")
+
     print(f"\nInserting buffers (max depth N={args.N} between restoration points) ...")
     modified = insert_buffers(
         module,
@@ -248,6 +279,7 @@ def main(argv: list[str] | None = None) -> int:
         lib,
         bb_cell=args.bb_cell,
         lanes=lanes,
+        supplies=supply_conns,
     )
     inserted = len(modified.instances) - len(module.instances)
     print(f"  Inserted {inserted} buffers instance(s)")
