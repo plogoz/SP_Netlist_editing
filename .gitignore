@@ -4,6 +4,7 @@
 # But track these files and folders
 !.gitignore
 !.gitmodules
+!README.md
 !uv.lock
 !pyproject.toml
 !.python-version
