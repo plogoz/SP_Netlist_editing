@@ -8,7 +8,7 @@ The tools also provide a script to check logical equivalence (using Yosys) to ca
 ### Dependencies :
 
 Before being able to use these tools, you need to have the following prerequisites installed (both .lib and .cdl flows):
-- UV (https://github.com/astral-sh/uv.git)
+- UV : https://github.com/astral-sh/uv.git
 - Yosys : https://github.com/YosysHQ/yosys.git
 
 In case uv won't install matplotlib, you can do without it. The visualization tools will not work, but the netlist editing tools will function.
